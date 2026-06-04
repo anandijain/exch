@@ -114,6 +114,13 @@ Client queues must be bounded. If a client falls behind, disconnect it or force 
 from a snapshot/replay point. Junk subscribers should be able to lose their own feed, but not slow
 the book.
 
+Private order-entry reports should be generated before public feed events are enqueued. That lets
+the exchange say: "the participant's private accepted/executed/canceled report was created first."
+It should not promise that the participant receives the private report before another participant
+receives the public feed update, because socket scheduling and network paths can reverse observed
+arrival order. The implementation must also avoid letting a slow private socket delay public fanout
+indefinitely; private sessions need bounded queues or write timeouts.
+
 ## Kraken-Style vs ITCH-Style Feeds
 
 Kraken's public WebSocket book channel is subscription-oriented: clients ask for specific symbols

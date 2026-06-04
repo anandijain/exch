@@ -10,6 +10,7 @@ use tungstenite::{accept, Message, WebSocket};
 
 const ORDER_COMMANDS_PER_SECOND: u32 = 100;
 const FEED_CLIENT_QUEUE_CAPACITY: usize = 1024;
+const PRIVATE_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 fn main() -> std::io::Result<()> {
     let order_addr =
@@ -141,6 +142,7 @@ fn listen_feed_ws(addr: &str, exchange: Arc<ExchangeState>) -> std::io::Result<(
 type WsHandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandlerResult {
+    stream.set_write_timeout(Some(PRIVATE_WRITE_TIMEOUT))?;
     let mut socket = accept(stream)?;
     let mut rate_limit = RateLimit::per_second(ORDER_COMMANDS_PER_SECOND);
     socket.send(Message::Text(
@@ -157,12 +159,15 @@ fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandler
             continue;
         }
 
-        let response = if rate_limit.allow() {
+        let result = if rate_limit.allow() {
             handle_order_command(message.to_text()?, &exchange)
         } else {
-            "error rate-limit-exceeded".to_string()
+            CommandResult::private("error rate-limit-exceeded")
         };
-        socket.send(Message::Text(response))?;
+        socket.send(Message::Text(result.private_response))?;
+        if let Some((instrument_id, events)) = result.public_events {
+            exchange.publish(instrument_id, &events);
+        }
     }
 }
 
@@ -294,22 +299,47 @@ fn subscribe_feed_ws(
     Ok(())
 }
 
-fn handle_order_command(line: &str, exchange: &Arc<ExchangeState>) -> String {
+struct CommandResult {
+    private_response: String,
+    public_events: Option<(u32, Vec<BookEvent>)>,
+}
+
+impl CommandResult {
+    fn private(response: impl Into<String>) -> Self {
+        Self {
+            private_response: response.into(),
+            public_events: None,
+        }
+    }
+
+    fn with_public(
+        response: impl Into<String>,
+        instrument_id: u32,
+        events: Vec<BookEvent>,
+    ) -> Self {
+        Self {
+            private_response: response.into(),
+            public_events: Some((instrument_id, events)),
+        }
+    }
+}
+
+fn handle_order_command(line: &str, exchange: &Arc<ExchangeState>) -> CommandResult {
     let parts = line.split_whitespace().collect::<Vec<_>>();
     let Some(command) = parts.first().copied() else {
-        return "error empty-command".to_string();
+        return CommandResult::private("error empty-command");
     };
 
     match command {
-        "help" => "ok help instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity> | replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id> | account <account_id> <asset> | revenue <asset>".to_string(),
-        "instruments" => instruments(exchange),
-        "book" => book(&parts, exchange),
+        "help" => CommandResult::private("ok help instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity> | replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id> | account <account_id> <asset> | revenue <asset>"),
+        "instruments" => CommandResult::private(instruments(exchange)),
+        "book" => CommandResult::private(book(&parts, exchange)),
         "order" => order(&parts, exchange),
         "replace" => replace(&parts, exchange),
         "cancel" => cancel(&parts, exchange),
-        "account" => account(&parts, exchange),
-        "revenue" => revenue(&parts, exchange),
-        _ => format!("error unknown-command command={command}"),
+        "account" => CommandResult::private(account(&parts, exchange)),
+        "revenue" => CommandResult::private(revenue(&parts, exchange)),
+        _ => CommandResult::private(format!("error unknown-command command={command}")),
     }
 }
 
@@ -365,28 +395,28 @@ fn book(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
     }
 }
 
-fn order(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
+fn order(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     if parts.len() != 7 {
-        return "error usage order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity>".to_string();
+        return CommandResult::private("error usage order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity>");
     }
 
     let Some(instrument_id) = parse(parts[1]) else {
-        return "error invalid-instrument-id".to_string();
+        return CommandResult::private("error invalid-instrument-id");
     };
     let Some(order_id) = parse(parts[2]) else {
-        return "error invalid-order-id".to_string();
+        return CommandResult::private("error invalid-order-id");
     };
     let Some(account_id) = parse(parts[3]) else {
-        return "error invalid-account-id".to_string();
+        return CommandResult::private("error invalid-account-id");
     };
     let Ok(side) = parts[4].parse::<Side>() else {
-        return "error invalid-side".to_string();
+        return CommandResult::private("error invalid-side");
     };
     let Some(price) = parse(parts[5]) else {
-        return "error invalid-price".to_string();
+        return CommandResult::private("error invalid-price");
     };
     let Some(quantity) = parse(parts[6]) else {
-        return "error invalid-quantity".to_string();
+        return CommandResult::private("error invalid-quantity");
     };
 
     let order = NewOrder {
@@ -404,30 +434,30 @@ fn order(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
         .submit_limit(instrument_id, order)
     {
         Ok(events) => {
-            exchange.publish(instrument_id, &events);
-            format!(
+            let response = format!(
                 "ok events {}",
                 events
                     .iter()
                     .map(private_event)
                     .collect::<Vec<_>>()
                     .join("|")
-            )
+            );
+            CommandResult::with_public(response, instrument_id, events)
         }
-        Err(_) => "error unknown-instrument".to_string(),
+        Err(_) => CommandResult::private("error unknown-instrument"),
     }
 }
 
-fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
+fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     if parts.len() != 3 {
-        return "error usage cancel <instrument_id> <order_id>".to_string();
+        return CommandResult::private("error usage cancel <instrument_id> <order_id>");
     }
 
     let Some(instrument_id) = parse(parts[1]) else {
-        return "error invalid-instrument-id".to_string();
+        return CommandResult::private("error invalid-instrument-id");
     };
     let Some(order_id) = parse(parts[2]) else {
-        return "error invalid-order-id".to_string();
+        return CommandResult::private("error invalid-order-id");
     };
 
     match exchange
@@ -437,38 +467,38 @@ fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
         .cancel(instrument_id, order_id)
     {
         Ok(book_event) => {
-            exchange.publish(instrument_id, std::slice::from_ref(&book_event));
-            format!("ok events {}", private_event(&book_event))
+            let response = format!("ok events {}", private_event(&book_event));
+            CommandResult::with_public(response, instrument_id, vec![book_event])
         }
-        Err(_) => "error unknown-instrument".to_string(),
+        Err(_) => CommandResult::private("error unknown-instrument"),
     }
 }
 
-fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
+fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     if parts.len() != 8 {
-        return "error usage replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity>".to_string();
+        return CommandResult::private("error usage replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity>");
     }
 
     let Some(instrument_id) = parse(parts[1]) else {
-        return "error invalid-instrument-id".to_string();
+        return CommandResult::private("error invalid-instrument-id");
     };
     let Some(old_order_id) = parse(parts[2]) else {
-        return "error invalid-old-order-id".to_string();
+        return CommandResult::private("error invalid-old-order-id");
     };
     let Some(new_order_id) = parse(parts[3]) else {
-        return "error invalid-new-order-id".to_string();
+        return CommandResult::private("error invalid-new-order-id");
     };
     let Some(account_id) = parse(parts[4]) else {
-        return "error invalid-account-id".to_string();
+        return CommandResult::private("error invalid-account-id");
     };
     let Ok(side) = parts[5].parse::<Side>() else {
-        return "error invalid-side".to_string();
+        return CommandResult::private("error invalid-side");
     };
     let Some(price) = parse(parts[6]) else {
-        return "error invalid-price".to_string();
+        return CommandResult::private("error invalid-price");
     };
     let Some(quantity) = parse(parts[7]) else {
-        return "error invalid-quantity".to_string();
+        return CommandResult::private("error invalid-quantity");
     };
 
     let order = NewOrder {
@@ -486,17 +516,17 @@ fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
         .replace_limit(instrument_id, old_order_id, order)
     {
         Ok(events) => {
-            exchange.publish(instrument_id, &events);
-            format!(
+            let response = format!(
                 "ok events {}",
                 events
                     .iter()
                     .map(private_event)
                     .collect::<Vec<_>>()
                     .join("|")
-            )
+            );
+            CommandResult::with_public(response, instrument_id, events)
         }
-        Err(_) => "error unknown-instrument".to_string(),
+        Err(_) => CommandResult::private("error unknown-instrument"),
     }
 }
 
