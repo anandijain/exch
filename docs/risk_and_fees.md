@@ -69,3 +69,35 @@ Public deployment should add:
 - max order notional;
 - max messages per second;
 - disconnect or cool-down after repeated rejects.
+
+## Current Order-Entry Commands
+
+Both local TCP and WebSocket order-entry gateways support:
+
+```text
+order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity>
+replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity>
+cancel <instrument_id> <order_id>
+account <account_id> <asset>
+revenue <asset>
+```
+
+`order_id` currently acts as the idempotent client order id. If the exact same order is retried, the
+venue returns the original events instead of submitting a duplicate. Reusing the id for different
+order details is rejected.
+
+`replace` is currently a simple cancel-then-new command. The final exchange version should make
+cancel-replace atomic inside the matching lane.
+
+## Large Takers and Partial Fills
+
+If a large incoming buy crosses multiple resting sell orders, the matcher emits one execution event
+per resting order consumed. A single aggressive order can therefore produce many public feed events.
+
+If the incoming order only takes part of a resting order, the resting order remains on the book with
+reduced quantity. The public feed emits an execution for the filled quantity; clients subtract that
+quantity from the visible resting order or level.
+
+If the incoming order consumes all available liquidity at prices allowed by its limit and still has
+quantity left, the remainder rests at its limit price. The private response contains executions and
+a rested event; the public feed also receives public execution/rested events.

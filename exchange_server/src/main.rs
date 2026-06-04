@@ -143,7 +143,7 @@ fn handle_order_client(stream: TcpStream, exchange: Arc<ExchangeState>) -> std::
 
     writeln!(
         writer,
-        "ok hello protocol=exch-order-entry commands=instruments,book,order,cancel,help"
+        "ok hello protocol=exch-order-entry commands=instruments,book,order,replace,cancel,account,revenue,help"
     )?;
 
     for line in reader.lines() {
@@ -294,13 +294,16 @@ fn handle_order_command(line: &str, exchange: &Arc<ExchangeState>) -> String {
         "instruments" => instruments(exchange),
         "book" => book(&parts, exchange),
         "order" => order(&parts, exchange),
+        "replace" => replace(&parts, exchange),
         "cancel" => cancel(&parts, exchange),
+        "account" => account(&parts, exchange),
+        "revenue" => revenue(&parts, exchange),
         _ => format!("error unknown-command command={command}"),
     }
 }
 
 fn help() -> String {
-    "ok help instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id>".to_string()
+    "ok help instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity> | replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id> | account <account_id> <asset> | revenue <asset>".to_string()
 }
 
 fn instruments(exchange: &Arc<ExchangeState>) -> String {
@@ -432,6 +435,89 @@ fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
         }
         Err(_) => "error unknown-instrument".to_string(),
     }
+}
+
+fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
+    if parts.len() != 8 {
+        return "error usage replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity>".to_string();
+    }
+
+    let Some(instrument_id) = parse(parts[1], "instrument_id") else {
+        return "error invalid-instrument-id".to_string();
+    };
+    let Some(old_order_id) = parse(parts[2], "old_order_id") else {
+        return "error invalid-old-order-id".to_string();
+    };
+    let Some(new_order_id) = parse(parts[3], "new_order_id") else {
+        return "error invalid-new-order-id".to_string();
+    };
+    let Some(account_id) = parse(parts[4], "account_id") else {
+        return "error invalid-account-id".to_string();
+    };
+    let Ok(side) = parts[5].parse::<Side>() else {
+        return "error invalid-side".to_string();
+    };
+    let Some(price) = parse(parts[6], "price") else {
+        return "error invalid-price".to_string();
+    };
+    let Some(quantity) = parse(parts[7], "quantity") else {
+        return "error invalid-quantity".to_string();
+    };
+
+    let order = NewOrder {
+        order_id: new_order_id,
+        account_id,
+        side,
+        price: Price(price),
+        quantity,
+    };
+
+    match exchange
+        .venue
+        .lock()
+        .expect("venue mutex poisoned")
+        .replace_limit(instrument_id, old_order_id, order)
+    {
+        Ok(events) => {
+            exchange.publish(instrument_id, &events);
+            format!(
+                "ok events {}",
+                events
+                    .iter()
+                    .map(private_event)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            )
+        }
+        Err(_) => "error unknown-instrument".to_string(),
+    }
+}
+
+fn account(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
+    if parts.len() != 3 {
+        return "error usage account <account_id> <asset>".to_string();
+    }
+    let Some(account_id) = parse(parts[1], "account_id") else {
+        return "error invalid-account-id".to_string();
+    };
+    let asset = parts[2];
+    let venue = exchange.venue.lock().expect("venue mutex poisoned");
+    format!(
+        "ok account account={} asset={} available={} reserved={}",
+        account_id,
+        asset,
+        venue.balance(account_id, asset),
+        venue.reserved(account_id, asset)
+    )
+}
+
+fn revenue(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
+    if parts.len() != 2 {
+        return "error usage revenue <asset>".to_string();
+    }
+    let asset = parts[1];
+    let venue = exchange.venue.lock().expect("venue mutex poisoned");
+    format!("ok revenue asset={} amount={}", asset, venue.revenue(asset))
 }
 
 fn parse<T: std::str::FromStr>(value: &str, _name: &str) -> Option<T> {

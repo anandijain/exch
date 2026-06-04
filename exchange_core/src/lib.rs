@@ -47,6 +47,8 @@ pub struct VenueConfig {
     pub name: String,
     pub instruments: Vec<Instrument>,
     pub default_snapshot_depth: usize,
+    pub max_open_orders_per_account: usize,
+    pub max_order_notional: Amount,
 }
 
 impl VenueConfig {
@@ -75,6 +77,8 @@ impl VenueConfig {
             name: name.into(),
             instruments,
             default_snapshot_depth: 10,
+            max_open_orders_per_account: 1_000,
+            max_order_notional: 1_000_000_000_000,
         }
     }
 
@@ -104,6 +108,8 @@ impl VenueConfig {
             name: name.into(),
             instruments,
             default_snapshot_depth: 10,
+            max_open_orders_per_account: 1_000,
+            max_order_notional: 1_000_000_000_000,
         }
     }
 
@@ -144,6 +150,8 @@ impl VenueConfig {
             name: name.into(),
             instruments,
             default_snapshot_depth: 10,
+            max_open_orders_per_account: 1_000,
+            max_order_notional: 1_000_000_000_000,
         }
     }
 }
@@ -190,6 +198,7 @@ pub struct Venue {
     books: BTreeMap<InstrumentId, OrderBook>,
     accounts: BTreeMap<AccountId, Account>,
     order_reservations: BTreeMap<OrderId, Reservation>,
+    order_history: BTreeMap<OrderId, OrderRecord>,
     revenue: BTreeMap<String, Amount>,
 }
 
@@ -206,6 +215,7 @@ impl Venue {
             books,
             accounts: BTreeMap::new(),
             order_reservations: BTreeMap::new(),
+            order_history: BTreeMap::new(),
             revenue: BTreeMap::new(),
         }
     }
@@ -219,6 +229,16 @@ impl Venue {
         instrument_id: InstrumentId,
         order: NewOrder,
     ) -> Result<Vec<BookEvent>, VenueError> {
+        if let Some(record) = self.order_history.get(&order.order_id) {
+            if record.instrument_id == instrument_id && record.order == order {
+                return Ok(record.events.clone());
+            }
+
+            return self
+                .book_mut(instrument_id)
+                .map(|book| vec![book.reject(order.order_id, RejectReason::DuplicateOrderId)]);
+        }
+
         let instrument = self.instrument(instrument_id)?.clone();
         let reject_reason = self.validate_order(&instrument, &order);
         if let Some(reason) = reject_reason {
@@ -230,6 +250,25 @@ impl Venue {
         let reservation = self.reserve_for_order(&instrument, &order);
         let events = self.book_mut(instrument_id)?.submit_limit(order.clone());
         self.apply_economics(&instrument, &order, &events, reservation);
+        self.order_history.insert(
+            order.order_id,
+            OrderRecord {
+                instrument_id,
+                order,
+                events: events.clone(),
+            },
+        );
+        Ok(events)
+    }
+
+    pub fn replace_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        old_order_id: OrderId,
+        new_order: NewOrder,
+    ) -> Result<Vec<BookEvent>, VenueError> {
+        let mut events = vec![self.cancel(instrument_id, old_order_id)?];
+        events.extend(self.submit_limit(instrument_id, new_order)?);
         Ok(events)
     }
 
@@ -309,13 +348,27 @@ impl Venue {
         if notional < instrument.min_notional {
             return Some(RejectReason::BelowMinNotional);
         }
+        if notional > self.config.max_order_notional {
+            return Some(RejectReason::MaxOrderNotionalExceeded);
+        }
         if self.order_reservations.contains_key(&order.order_id) {
             return Some(RejectReason::DuplicateOrderId);
+        }
+        if self.open_orders_for_account(order.account_id) >= self.config.max_open_orders_per_account
+        {
+            return Some(RejectReason::MaxOpenOrdersExceeded);
         }
         if !self.has_available_for_order(instrument, order) {
             return Some(RejectReason::InsufficientAvailableBalance);
         }
         None
+    }
+
+    fn open_orders_for_account(&self, account_id: AccountId) -> usize {
+        self.order_reservations
+            .values()
+            .filter(|reservation| reservation.account_id == account_id)
+            .count()
     }
 
     fn has_available_for_order(&self, instrument: &Instrument, order: &NewOrder) -> bool {
@@ -606,6 +659,15 @@ pub enum RejectReason {
     InvalidQuantityStep,
     BelowMinNotional,
     InsufficientAvailableBalance,
+    MaxOpenOrdersExceeded,
+    MaxOrderNotionalExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderRecord {
+    instrument_id: InstrumentId,
+    order: NewOrder,
+    events: Vec<BookEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1174,6 +1236,63 @@ mod tests {
         assert_eq!(venue.balance(2, "USD"), 9);
         assert_eq!(venue.reserved(1, "AAA"), 0);
         assert_eq!(venue.reserved(2, "USD"), 0);
+    }
+
+    #[test]
+    fn duplicate_order_id_returns_same_events_for_same_order() {
+        let mut venue = Venue::new(VenueConfig::star("equities", "USD", ["AAA"]));
+        venue.credit(1, "USD", 1_001);
+        let new_order = order(1, Side::Buy, 100, 10);
+
+        let first = venue
+            .submit_limit(0, new_order.clone())
+            .expect("first order");
+        let retry = venue.submit_limit(0, new_order).expect("retry");
+
+        assert_eq!(first, retry);
+        assert_eq!(venue.reserved(1, "USD"), 1_001);
+    }
+
+    #[test]
+    fn rejects_above_max_notional() {
+        let mut config = VenueConfig::star("equities", "USD", ["AAA"]);
+        config.max_order_notional = 999;
+        let mut venue = Venue::new(config);
+        venue.credit(1, "USD", 10_000);
+
+        let events = venue
+            .submit_limit(0, order(1, Side::Buy, 100, 10))
+            .expect("instrument exists");
+
+        assert!(matches!(
+            events[0],
+            BookEvent::Rejected {
+                reason: RejectReason::MaxOrderNotionalExceeded,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn replace_cancels_old_order_and_submits_new_order() {
+        let mut venue = Venue::new(VenueConfig::star("equities", "USD", ["AAA"]));
+        venue.credit(1, "USD", 5_000);
+        venue
+            .submit_limit(0, order(1, Side::Buy, 100, 10))
+            .expect("first order");
+
+        let events = venue
+            .replace_limit(0, 1, order(2, Side::Buy, 99, 5))
+            .expect("replace");
+
+        assert!(matches!(events[0], BookEvent::Canceled { order_id: 1, .. }));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, BookEvent::Rested { order_id: 2, .. })));
+        assert_eq!(
+            venue.snapshot(0, 10).expect("snapshot").bids[0].price,
+            Price(99)
+        );
     }
 
     fn order(order_id: OrderId, side: Side, price: u64, quantity: Quantity) -> NewOrder {

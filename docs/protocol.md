@@ -22,7 +22,10 @@ help
 instruments
 book <instrument_id> [depth]
 order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity>
+replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity>
 cancel <instrument_id> <order_id>
+account <account_id> <asset>
+revenue <asset>
 ```
 
 Order-entry responses are private to the client that sent the command. They include accepts,
@@ -54,6 +57,8 @@ order 0 1 100 buy 10000 25
 order 0 2 101 sell 10000 10
 book 0 10
 cancel 0 1
+account 100 USD
+revenue USD
 ```
 
 The book response includes the current sequence number, checksum, bid levels, and ask levels.
