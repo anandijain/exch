@@ -23,6 +23,44 @@ For this project:
 - The same core `BookEvent` should feed both private order responses and public book updates, but
   those should be delivered over separate channels.
 
+## Order Entry Implementation
+
+Order entry should be reliable, private, authenticated, and point-to-point. For this project that
+means TCP-family protocols, not UDP multicast.
+
+Implement it in three stages:
+
+1. Local line protocol over TCP.
+   Keep `exchange_server` easy to script. One client connection sends `order` and `cancel`
+   commands. The server replies on the same connection with private `accepted`, `rejected`,
+   `canceled`, and `executed` messages.
+
+2. Public internet API over TLS.
+   Use HTTPS for simple request/response order entry first. Add WebSocket over TLS when we want a
+   persistent private order-entry session. This is still TCP underneath, but TLS gives encryption
+   and server identity. The first public version should require API keys, tight rate limits, and
+   small configured venue limits.
+
+3. Native binary protocol later.
+   Once semantics are stable, add a compact length-prefixed binary protocol. It should still run
+   over TCP/TLS for internet use. On a home lab network it can run over plain TCP if the network is
+   trusted.
+
+The order-entry session should eventually have:
+
+- login/authenticate;
+- heartbeat;
+- client order id;
+- exchange order id;
+- new order;
+- cancel order;
+- replace order;
+- private accept/reject/cancel/execution;
+- replay or query for recent private session state after reconnect.
+
+For now, the local TCP line protocol is the right seed. The next meaningful upgrade is not UDP; it
+is a real session model with authentication, heartbeats, and idempotent client order ids.
+
 ## UDP Multicast
 
 UDP is a connectionless packet protocol. Unlike TCP, it does not promise delivery, ordering, or
@@ -43,6 +81,47 @@ participant-specific responses. That is why the local project should model:
 - order entry as point-to-point TCP first;
 - market data as TCP fanout first;
 - later market data as UDP multicast plus snapshot/replay.
+
+For public internet deployment, assume TCP/WebSocket/SSE for market data too. Internet multicast is
+not generally available to ordinary clients. UDP multicast becomes useful in the home lab, a data
+center, or a controlled LAN where routers/switches are configured to carry multicast groups.
+
+## Kraken-Style vs ITCH-Style Feeds
+
+Kraken's public WebSocket book channel is subscription-oriented: clients ask for specific symbols
+and depth. That is ergonomic for internet APIs and small clients. It also maps well to crypto-style
+venues where clients usually care about a subset of pairs.
+
+ITCH-style feeds are closer to an exchange data product: subscribe to a channel/feed, receive
+sequenced binary messages for a broad symbol universe, and reconstruct whatever symbols you care
+about. Symbol metadata appears in the feed so clients can map compact identifiers to symbols.
+
+This project should support both shapes:
+
+- internet API: Kraken-style `subscribe <symbols>` because it is friendly and cheap;
+- LAN exchange lab: ITCH-style feed channels carrying many instruments;
+- internal representation: one append-only event log per partition so either external style can be
+  produced from the same committed events.
+
+## Partitions, Bins, and Feed Ordering
+
+If symbols are partitioned across matching engines, some partitions can absolutely be busier than
+others. A hot symbol's partition may have higher queueing delay than a quiet partition. Exchanges
+manage this operationally by assigning symbols carefully, rebalancing over time, using fast
+hardware/software, and publishing clear feed/channel definitions.
+
+Do not require one global total order across all symbols. It is expensive and usually unnecessary.
+Use this model instead:
+
+- one serial command sequence per instrument or partition;
+- one market-data sequence per feed channel;
+- every event includes instrument id, partition id, and sequence number;
+- clients preserve order within a feed channel;
+- clients do not infer exact causality between unrelated symbols on unrelated channels.
+
+If we later need cross-instrument experiments, such as currency-cycle arbitrage, the simulator can
+record a wall-clock receive timestamp and a per-partition sequence. But the matching invariant
+still lives inside each instrument's serial lane.
 
 ## Sequencing and Fairness
 
