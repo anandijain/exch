@@ -86,6 +86,23 @@ For public internet deployment, assume TCP/WebSocket/SSE for market data too. In
 not generally available to ordinary clients. UDP multicast becomes useful in the home lab, a data
 center, or a controlled LAN where routers/switches are configured to carry multicast groups.
 
+Public WebSocket fanout does not give simultaneous delivery. The server writes the same logical
+event to many client sockets, and those writes complete at different times. Then packets traverse
+different network paths and client machines process them at different speeds. That means some
+participants will learn public book updates before others.
+
+For this project, treat that as an unavoidable property of public internet access. Mitigate it by:
+
+- assigning authoritative sequence numbers at the exchange, not at client receive time;
+- publishing exchange-side timestamps on events;
+- keeping fanout code simple and bounded so slow clients cannot delay fast clients;
+- documenting that public internet market data is best-effort and not latency-equal;
+- using LAN multicast later when we want to study more exchange-like equal-input feed delivery.
+
+Even multicast does not make clients receive at exactly the same time, but it avoids per-client
+server writes and makes the exchange publish one packet per feed channel instead of one packet per
+subscriber.
+
 ## Kraken-Style vs ITCH-Style Feeds
 
 Kraken's public WebSocket book channel is subscription-oriented: clients ask for specific symbols
