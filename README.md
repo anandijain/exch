@@ -44,6 +44,15 @@ cargo run --release -p exchange_sim -- --commands 1000000 --traders 1000 --feed-
 
 See `docs/benchmarking.md` for what it measures.
 
+Run the first local WebSocket gateway:
+
+```powershell
+cargo run -p exchange_ws
+```
+
+It exposes private order entry on `ws://127.0.0.1:7011` and public market data on
+`ws://127.0.0.1:7012`.
+
 ## Configuration Philosophy
 
 Venue topology should be configurable without changing matching code:

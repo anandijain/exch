@@ -36,10 +36,10 @@ Implement it in three stages:
    `canceled`, and `executed` messages.
 
 2. Public internet API over TLS.
-   Use HTTPS for simple request/response order entry first. Add WebSocket over TLS when we want a
-   persistent private order-entry session. This is still TCP underneath, but TLS gives encryption
-   and server identity. The first public version should require API keys, tight rate limits, and
-   small configured venue limits.
+   Use WebSocket over TLS for the main private order-entry session. This is still TCP underneath,
+   but TLS gives encryption and server identity. Keep HTTPS endpoints for slower account/status
+   reads, health checks, and administrative setup. The first public version should require API
+   keys, tight rate limits, and small configured venue limits.
 
 3. Native binary protocol later.
    Once semantics are stable, add a compact length-prefixed binary protocol. It should still run

@@ -2,7 +2,7 @@
 
 ## Next Order-Entry Work
 
-Keep order entry TCP-based.
+Keep order entry TCP-based, but make WebSocket the main public-client protocol.
 
 1. Add sessions.
    A client connects, receives a session id, and sends heartbeats. The server closes idle sessions.
@@ -25,7 +25,7 @@ Keep order entry TCP-based.
 
 ## Next Market-Data Work
 
-Keep public internet market data TCP/WebSocket-style. Add UDP multicast only for the LAN lab.
+Keep public internet market data WebSocket-style. Add UDP multicast only for the LAN lab.
 
 1. Add an append-only feed log.
    Persist every public feed event with instrument id, partition id, sequence, and checksum.

@@ -1,0 +1,9 @@
+[package]
+name = "exchange_ws"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exchange_core = { path = "../exchange_core" }
+tungstenite = "0.24"

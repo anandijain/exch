@@ -63,3 +63,21 @@ the same public execution as an `event`.
 
 This protocol is not the final public API. It is a local test harness that keeps the first server
 dependency-free and easy to drive from scripts, terminals, and property tests.
+
+## WebSocket Gateway
+
+`exchange_ws` exposes the same command language over local WebSockets:
+
+- private order entry: `ws://127.0.0.1:7011`
+- public market data: `ws://127.0.0.1:7012`
+
+Run:
+
+```powershell
+cargo run -p exchange_ws
+```
+
+Override with `EXCH_WS_ORDER_ADDR` and `EXCH_WS_FEED_ADDR`.
+
+This is closer to the intended public internet shape. Public deployment should put TLS in front of
+these sessions, so clients connect with `wss://...`.
