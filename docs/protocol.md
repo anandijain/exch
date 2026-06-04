@@ -90,3 +90,17 @@ Override with `EXCH_WS_ORDER_ADDR` and `EXCH_WS_FEED_ADDR`.
 
 This is closer to the intended public internet shape. Public deployment should put TLS in front of
 these sessions, so clients connect with `wss://...`.
+
+The WebSocket order-entry gateway requires:
+
+```text
+auth <api_key>
+```
+
+after connecting. Once authenticated, order/account commands use the account mapped to that API key:
+
+```text
+order <instrument_id> <order_id> <buy|sell> <price> <quantity>
+replace <instrument_id> <old_order_id> <new_order_id> <buy|sell> <price> <quantity>
+account <asset>
+```

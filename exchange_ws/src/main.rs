@@ -1,6 +1,8 @@
 use exchange_core::{BookEvent, Level, NewOrder, Price, Side, Venue, VenueConfig};
+use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
+use std::fs;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -30,6 +32,7 @@ fn main() -> std::io::Result<()> {
 
 struct ExchangeState {
     venue: Mutex<Venue>,
+    api_keys: ApiKeys,
     feed_subscribers: Mutex<Vec<FeedSubscriber>>,
 }
 
@@ -39,6 +42,7 @@ impl ExchangeState {
         seed_demo_accounts(&mut venue);
         Self {
             venue: Mutex::new(venue),
+            api_keys: ApiKeys::load(),
             feed_subscribers: Mutex::new(Vec::new()),
         }
     }
@@ -80,6 +84,59 @@ impl ExchangeState {
                 instrument_id,
                 sender,
             });
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ApiKey {
+    account_id: u64,
+    label: String,
+}
+
+#[derive(Debug, Clone)]
+struct ApiKeys {
+    keys: BTreeMap<String, ApiKey>,
+}
+
+impl ApiKeys {
+    fn load() -> Self {
+        let path =
+            env::var("EXCH_API_KEYS").unwrap_or_else(|_| "config/local/api_keys.txt".to_string());
+        match fs::read_to_string(&path) {
+            Ok(contents) => Self::parse(&contents),
+            Err(_) => Self::parse(include_str!("../../config/public_access.example.txt")),
+        }
+    }
+
+    fn parse(contents: &str) -> Self {
+        let mut keys = BTreeMap::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts = line.split_whitespace().collect::<Vec<_>>();
+            if parts.len() < 2 {
+                continue;
+            }
+            let Ok(account_id) = parts[1].parse() else {
+                continue;
+            };
+            keys.insert(
+                parts[0].to_string(),
+                ApiKey {
+                    account_id,
+                    label: parts.get(2).copied().unwrap_or("unlabeled").to_string(),
+                },
+            );
+        }
+
+        Self { keys }
+    }
+
+    fn authenticate(&self, key: &str) -> Option<&ApiKey> {
+        self.keys.get(key)
     }
 }
 
@@ -145,8 +202,9 @@ fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandler
     stream.set_write_timeout(Some(PRIVATE_WRITE_TIMEOUT))?;
     let mut socket = accept(stream)?;
     let mut rate_limit = RateLimit::per_second(ORDER_COMMANDS_PER_SECOND);
+    let mut session = OrderSession::default();
     socket.send(Message::Text(
-        "ok hello protocol=exch-ws-order commands=instruments,book,order,replace,cancel,account,revenue,help".to_string(),
+        "ok hello protocol=exch-ws-order commands=auth,instruments,book,order,replace,cancel,account,revenue,help".to_string(),
     ))?;
 
     loop {
@@ -160,7 +218,7 @@ fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandler
         }
 
         let result = if rate_limit.allow() {
-            handle_order_command(message.to_text()?, &exchange)
+            handle_order_command(message.to_text()?, &exchange, &mut session)
         } else {
             CommandResult::private("error rate-limit-exceeded")
         };
@@ -168,6 +226,23 @@ fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandler
         if let Some((instrument_id, events)) = result.public_events {
             exchange.publish(instrument_id, &events);
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct OrderSession {
+    account_id: Option<u64>,
+    label: Option<String>,
+}
+
+impl OrderSession {
+    fn authenticate(&mut self, api_key: &ApiKey) {
+        self.account_id = Some(api_key.account_id);
+        self.label = Some(api_key.label.clone());
+    }
+
+    fn account_id(&self) -> Option<u64> {
+        self.account_id
     }
 }
 
@@ -324,22 +399,48 @@ impl CommandResult {
     }
 }
 
-fn handle_order_command(line: &str, exchange: &Arc<ExchangeState>) -> CommandResult {
+fn handle_order_command(
+    line: &str,
+    exchange: &Arc<ExchangeState>,
+    session: &mut OrderSession,
+) -> CommandResult {
     let parts = line.split_whitespace().collect::<Vec<_>>();
     let Some(command) = parts.first().copied() else {
         return CommandResult::private("error empty-command");
     };
 
     match command {
-        "help" => CommandResult::private("ok help instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity> | replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id> | account <account_id> <asset> | revenue <asset>"),
+        "help" => CommandResult::private("ok help auth <api_key> | instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <buy|sell> <price> <quantity> | replace <instrument_id> <old_order_id> <new_order_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id> | account <asset> | revenue <asset>"),
+        "auth" => auth(&parts, exchange, session),
         "instruments" => CommandResult::private(instruments(exchange)),
         "book" => CommandResult::private(book(&parts, exchange)),
-        "order" => order(&parts, exchange),
-        "replace" => replace(&parts, exchange),
+        "order" => order(&parts, exchange, session),
+        "replace" => replace(&parts, exchange, session),
         "cancel" => cancel(&parts, exchange),
-        "account" => CommandResult::private(account(&parts, exchange)),
+        "account" => CommandResult::private(account(&parts, exchange, session)),
         "revenue" => CommandResult::private(revenue(&parts, exchange)),
         _ => CommandResult::private(format!("error unknown-command command={command}")),
+    }
+}
+
+fn auth(
+    parts: &[&str],
+    exchange: &Arc<ExchangeState>,
+    session: &mut OrderSession,
+) -> CommandResult {
+    if parts.len() != 2 {
+        return CommandResult::private("error usage auth <api_key>");
+    }
+
+    match exchange.api_keys.authenticate(parts[1]) {
+        Some(api_key) => {
+            session.authenticate(api_key);
+            CommandResult::private(format!(
+                "ok auth account={} label={}",
+                api_key.account_id, api_key.label
+            ))
+        }
+        None => CommandResult::private("error auth-failed"),
     }
 }
 
@@ -395,9 +496,14 @@ fn book(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
     }
 }
 
-fn order(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
-    if parts.len() != 7 {
-        return CommandResult::private("error usage order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity>");
+fn order(parts: &[&str], exchange: &Arc<ExchangeState>, session: &OrderSession) -> CommandResult {
+    let Some(account_id) = session.account_id() else {
+        return CommandResult::private("error not-authenticated");
+    };
+    if parts.len() != 6 {
+        return CommandResult::private(
+            "error usage order <instrument_id> <order_id> <buy|sell> <price> <quantity>",
+        );
     }
 
     let Some(instrument_id) = parse(parts[1]) else {
@@ -406,16 +512,13 @@ fn order(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     let Some(order_id) = parse(parts[2]) else {
         return CommandResult::private("error invalid-order-id");
     };
-    let Some(account_id) = parse(parts[3]) else {
-        return CommandResult::private("error invalid-account-id");
-    };
-    let Ok(side) = parts[4].parse::<Side>() else {
+    let Ok(side) = parts[3].parse::<Side>() else {
         return CommandResult::private("error invalid-side");
     };
-    let Some(price) = parse(parts[5]) else {
+    let Some(price) = parse(parts[4]) else {
         return CommandResult::private("error invalid-price");
     };
-    let Some(quantity) = parse(parts[6]) else {
+    let Some(quantity) = parse(parts[5]) else {
         return CommandResult::private("error invalid-quantity");
     };
 
@@ -474,9 +577,12 @@ fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     }
 }
 
-fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
-    if parts.len() != 8 {
-        return CommandResult::private("error usage replace <instrument_id> <old_order_id> <new_order_id> <account_id> <buy|sell> <price> <quantity>");
+fn replace(parts: &[&str], exchange: &Arc<ExchangeState>, session: &OrderSession) -> CommandResult {
+    let Some(account_id) = session.account_id() else {
+        return CommandResult::private("error not-authenticated");
+    };
+    if parts.len() != 7 {
+        return CommandResult::private("error usage replace <instrument_id> <old_order_id> <new_order_id> <buy|sell> <price> <quantity>");
     }
 
     let Some(instrument_id) = parse(parts[1]) else {
@@ -488,16 +594,13 @@ fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     let Some(new_order_id) = parse(parts[3]) else {
         return CommandResult::private("error invalid-new-order-id");
     };
-    let Some(account_id) = parse(parts[4]) else {
-        return CommandResult::private("error invalid-account-id");
-    };
-    let Ok(side) = parts[5].parse::<Side>() else {
+    let Ok(side) = parts[4].parse::<Side>() else {
         return CommandResult::private("error invalid-side");
     };
-    let Some(price) = parse(parts[6]) else {
+    let Some(price) = parse(parts[5]) else {
         return CommandResult::private("error invalid-price");
     };
-    let Some(quantity) = parse(parts[7]) else {
+    let Some(quantity) = parse(parts[6]) else {
         return CommandResult::private("error invalid-quantity");
     };
 
@@ -530,14 +633,14 @@ fn replace(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
     }
 }
 
-fn account(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
-    if parts.len() != 3 {
-        return "error usage account <account_id> <asset>".to_string();
-    }
-    let Some(account_id) = parse(parts[1]) else {
-        return "error invalid-account-id".to_string();
+fn account(parts: &[&str], exchange: &Arc<ExchangeState>, session: &OrderSession) -> String {
+    let Some(account_id) = session.account_id() else {
+        return "error not-authenticated".to_string();
     };
-    let asset = parts[2];
+    if parts.len() != 2 {
+        return "error usage account <asset>".to_string();
+    }
+    let asset = parts[1];
     let venue = exchange.venue.lock().expect("venue mutex poisoned");
     format!(
         "ok account account={} asset={} available={} reserved={}",

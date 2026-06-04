@@ -53,6 +53,7 @@ cargo run -p exchange_ws
 
 It exposes private order entry on `ws://127.0.0.1:7011` and public market data on
 `ws://127.0.0.1:7012`.
+See `docs/public_access.md` for API key setup.
 
 ## Configuration Philosophy
 

@@ -43,15 +43,23 @@ fn run_cycle(order_addr: &str, feed_addr: &str) -> (String, String, String, Stri
 
     let mut order = connect_with_retry(&format!("ws://{order_addr}"));
     assert!(read_text(&mut order).contains("exch-ws-order"));
+    order
+        .send(Message::Text("auth dev-key-100".to_string()))
+        .expect("send auth");
+    assert!(read_text(&mut order).contains("ok auth account=100"));
 
     order
-        .send(Message::Text("order 0 1 100 sell 10000 25".to_string()))
+        .send(Message::Text("order 0 1 sell 10000 25".to_string()))
         .expect("send sell");
     let sell_ack = read_text(&mut order);
     let feed_event_1 = read_text(&mut feed);
 
     order
-        .send(Message::Text("order 0 2 101 buy 10000 10".to_string()))
+        .send(Message::Text("auth dev-key-101".to_string()))
+        .expect("send auth 101");
+    assert!(read_text(&mut order).contains("ok auth account=101"));
+    order
+        .send(Message::Text("order 0 2 buy 10000 10".to_string()))
         .expect("send buy");
     let buy_ack = read_text(&mut order);
     let feed_event_2 = read_text(&mut feed);

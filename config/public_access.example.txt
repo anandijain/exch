@@ -1,0 +1,10 @@
+# Public-safe example API key file.
+#
+# Copy to config/local/api_keys.txt on the deployment host.
+# Do not commit real keys.
+#
+# Format:
+# key account_id label
+#
+dev-key-100 100 demo-account-100
+dev-key-101 101 demo-account-101
