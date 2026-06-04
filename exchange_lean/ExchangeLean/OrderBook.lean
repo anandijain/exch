@@ -1,8 +1,8 @@
 /-!
 A small Lean sketch for the exchange core.
 
-This is intentionally not wired into CI yet. The goal is to name the simple properties the Rust
-core should preserve before we build a fuller executable model.
+This is intentionally modest. The goal is to name the simple properties the Rust core should
+preserve before we build a fuller executable model.
 -/
 
 inductive Side where
