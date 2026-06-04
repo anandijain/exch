@@ -2,16 +2,154 @@ use std::collections::{BTreeMap, VecDeque};
 
 pub type OrderId = u64;
 pub type AccountId = u64;
+pub type InstrumentId = u32;
 pub type Quantity = u64;
 pub type Sequence = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Price(pub u64);
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Asset {
+    pub symbol: String,
+}
+
+impl Asset {
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Instrument {
+    pub id: InstrumentId,
+    pub base: Asset,
+    pub quote: Asset,
+    pub price_tick: Price,
+    pub quantity_step: Quantity,
+}
+
+impl Instrument {
+    pub fn symbol(&self) -> String {
+        format!("{}/{}", self.base.symbol, self.quote.symbol)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VenueConfig {
+    pub name: String,
+    pub instruments: Vec<Instrument>,
+    pub default_snapshot_depth: usize,
+}
+
+impl VenueConfig {
+    pub fn star(
+        name: impl Into<String>,
+        center: impl Into<String>,
+        spokes: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let center = Asset::new(center);
+        let instruments = spokes
+            .into_iter()
+            .enumerate()
+            .map(|(index, spoke)| Instrument {
+                id: index as InstrumentId,
+                base: Asset::new(spoke),
+                quote: center.clone(),
+                price_tick: Price(1),
+                quantity_step: 1,
+            })
+            .collect();
+
+        Self {
+            name: name.into(),
+            instruments,
+            default_snapshot_depth: 10,
+        }
+    }
+
+    pub fn complete_currency_graph(
+        name: impl Into<String>,
+        currencies: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let assets = currencies.into_iter().map(Asset::new).collect::<Vec<_>>();
+        let mut instruments = Vec::new();
+
+        for base_index in 0..assets.len() {
+            for quote_index in (base_index + 1)..assets.len() {
+                instruments.push(Instrument {
+                    id: instruments.len() as InstrumentId,
+                    base: assets[base_index].clone(),
+                    quote: assets[quote_index].clone(),
+                    price_tick: Price(1),
+                    quantity_step: 1,
+                });
+            }
+        }
+
+        Self {
+            name: name.into(),
+            instruments,
+            default_snapshot_depth: 10,
+        }
+    }
+
+    pub fn deterministic_sparse_currency_graph(
+        name: impl Into<String>,
+        currencies: impl IntoIterator<Item = impl Into<String>>,
+        edge_count: usize,
+        seed: u64,
+    ) -> Self {
+        let assets = currencies.into_iter().map(Asset::new).collect::<Vec<_>>();
+        let mut pairs = Vec::new();
+
+        for base_index in 0..assets.len() {
+            for quote_index in (base_index + 1)..assets.len() {
+                pairs.push((base_index, quote_index));
+            }
+        }
+
+        shuffle_pairs(&mut pairs, seed);
+        pairs.truncate(edge_count.min(pairs.len()));
+
+        let instruments = pairs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (base_index, quote_index))| Instrument {
+                id: index as InstrumentId,
+                base: assets[base_index].clone(),
+                quote: assets[quote_index].clone(),
+                price_tick: Price(1),
+                quantity_step: 1,
+            })
+            .collect();
+
+        Self {
+            name: name.into(),
+            instruments,
+            default_snapshot_depth: 10,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Buy,
     Sell,
+}
+
+impl std::str::FromStr for Side {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "buy" | "BUY" | "bid" | "BID" => Ok(Side::Buy),
+            "sell" | "SELL" | "ask" | "ASK" => Ok(Side::Sell),
+            _ => Err(()),
+        }
+    }
 }
 
 impl Side {
@@ -30,6 +168,68 @@ pub struct NewOrder {
     pub side: Side,
     pub price: Price,
     pub quantity: Quantity,
+}
+
+#[derive(Debug)]
+pub struct Venue {
+    config: VenueConfig,
+    books: BTreeMap<InstrumentId, OrderBook>,
+}
+
+impl Venue {
+    pub fn new(config: VenueConfig) -> Self {
+        let books = config
+            .instruments
+            .iter()
+            .map(|instrument| (instrument.id, OrderBook::new()))
+            .collect();
+
+        Self { config, books }
+    }
+
+    pub fn config(&self) -> &VenueConfig {
+        &self.config
+    }
+
+    pub fn submit_limit(
+        &mut self,
+        instrument_id: InstrumentId,
+        order: NewOrder,
+    ) -> Result<Vec<BookEvent>, VenueError> {
+        self.book_mut(instrument_id)
+            .map(|book| book.submit_limit(order))
+    }
+
+    pub fn cancel(
+        &mut self,
+        instrument_id: InstrumentId,
+        order_id: OrderId,
+    ) -> Result<BookEvent, VenueError> {
+        self.book_mut(instrument_id)
+            .map(|book| book.cancel(order_id))
+    }
+
+    pub fn snapshot(
+        &self,
+        instrument_id: InstrumentId,
+        depth: usize,
+    ) -> Result<BookSnapshot, VenueError> {
+        self.books
+            .get(&instrument_id)
+            .map(|book| book.snapshot(depth))
+            .ok_or(VenueError::UnknownInstrument)
+    }
+
+    fn book_mut(&mut self, instrument_id: InstrumentId) -> Result<&mut OrderBook, VenueError> {
+        self.books
+            .get_mut(&instrument_id)
+            .ok_or(VenueError::UnknownInstrument)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VenueError {
+    UnknownInstrument,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -406,6 +606,30 @@ impl AsciiU64 for u64 {
     }
 }
 
+fn shuffle_pairs(pairs: &mut [(usize, usize)], seed: u64) {
+    let mut rng = DeterministicRng::new(seed);
+    for index in (1..pairs.len()).rev() {
+        let swap_with = rng.next_usize(index + 1);
+        pairs.swap(index, swap_with);
+    }
+}
+
+struct DeterministicRng(u64);
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self(seed.max(1))
+    }
+
+    fn next_usize(&mut self, modulo: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (self.0 as usize) % modulo
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +744,34 @@ mod tests {
             }
         ));
         assert!(book.snapshot(10).asks.is_empty());
+    }
+
+    #[test]
+    fn builds_star_venue_config_for_equities_style_markets() {
+        let config = VenueConfig::star("equities", "USD", ["AAA", "BBB", "CCC"]);
+
+        assert_eq!(config.instruments.len(), 3);
+        assert_eq!(config.instruments[0].symbol(), "AAA/USD");
+        assert_eq!(config.instruments[2].symbol(), "CCC/USD");
+    }
+
+    #[test]
+    fn builds_deterministic_sparse_currency_graph() {
+        let left = VenueConfig::deterministic_sparse_currency_graph(
+            "fx",
+            ["USD", "EUR", "JPY", "GBP"],
+            4,
+            99,
+        );
+        let right = VenueConfig::deterministic_sparse_currency_graph(
+            "fx",
+            ["USD", "EUR", "JPY", "GBP"],
+            4,
+            99,
+        );
+
+        assert_eq!(left.instruments, right.instruments);
+        assert_eq!(left.instruments.len(), 4);
     }
 
     fn order(order_id: OrderId, side: Side, price: u64, quantity: Quantity) -> NewOrder {

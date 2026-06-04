@@ -6,9 +6,10 @@ some market-data flavor from Kraken and Nasdaq.
 ## Shape
 
 - `exchange_core`: deterministic matching engine and book event model.
+- `exchange_server`: dependency-free local TCP gateway for early experiments.
 - Future `exchange_api`: public HTTP/WebSocket API for placing orders and reading the book.
 - Future `exchange_gateway`: local-network UDP multicast publisher for exchange-style feeds.
-- Future `exchange_lean`: Lean model of the core invariants, plus a bridge from Rust tests to
+- `exchange_lean`: Lean model of the core invariants, plus a bridge from Rust tests to
   the verified model where practical.
 
 ## Product Direction
@@ -22,6 +23,30 @@ The first venue should be small and boring on purpose:
 - checksum snapshots inspired by Kraken so clients can detect missed or corrupt updates.
 
 Later venues can add separate fee schedules, asset lists, matching policies, and feed formats.
+
+## Local Experiments
+
+Run the local line-protocol server:
+
+```powershell
+cargo run -p exchange_server
+```
+
+See `docs/protocol.md` for the command format. The first gateway is intentionally not WebSocket or
+HTTP: it is a tiny harness for spinning up a configurable venue, placing orders, canceling orders,
+and reading the whole book with a checksum.
+
+## Configuration Philosophy
+
+Venue topology should be configurable without changing matching code:
+
+- star graphs for equities-style venues where one quote asset, such as fake USD, intermediates
+  all symbols;
+- complete or sparse currency graphs where cycles are natural;
+- deterministic generated graphs for experiments across many venue shapes.
+
+Prices and quantities are integer ticks/lots. Asset-specific decimal display is a presentation
+concern; matching should avoid floating point.
 
 ## Deployment Tracks
 
