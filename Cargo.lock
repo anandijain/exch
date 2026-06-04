@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "exchange_core",
 ]
+
+[[package]]
+name = "exchange_sim"
+version = "0.1.0"
+dependencies = [
+ "exchange_core",
+]

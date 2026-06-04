@@ -36,6 +36,14 @@ See `docs/protocol.md` for the command format. The first gateway is intentionall
 HTTP: it is a tiny harness for spinning up a configurable venue, placing orders, canceling orders,
 and reading the whole book with a checksum.
 
+Run the first single-bin simulator/benchmark:
+
+```powershell
+cargo run --release -p exchange_sim -- --commands 1000000 --traders 1000 --feed-subscribers 1
+```
+
+See `docs/benchmarking.md` for what it measures.
+
 ## Configuration Philosophy
 
 Venue topology should be configurable without changing matching code:

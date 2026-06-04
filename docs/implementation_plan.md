@@ -51,3 +51,14 @@ Use one serial matching lane per partition. A partition owns one or more instrum
 partition, sequence is total. Across partitions, sequence is not globally ordered.
 
 This is simpler, faster, and closer to how a scalable exchange should feel.
+
+## Interesting Experiments
+
+- Intentionally unbalanced symbol bins.
+  Put one group of instruments on a hot/slow partition and another group on a quiet/fast partition.
+  Then run cross-symbol or currency-cycle strategies to see whether delayed feed publication creates
+  a profitable stale-information exploit.
+
+- Single-bin throughput.
+  Keep all symbols in one serial matcher and measure accepted commands per second, public feed
+  events per second, and matcher-to-feed publication latency.
