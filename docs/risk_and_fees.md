@@ -101,3 +101,8 @@ quantity from the visible resting order or level.
 If the incoming order consumes all available liquidity at prices allowed by its limit and still has
 quantity left, the remainder rests at its limit price. The private response contains executions and
 a rested event; the public feed also receives public execution/rested events.
+
+The current matcher has no hidden liquidity, midpoint matching, discretionary pricing, or price
+improvement. That means the displayed resting price and execution price are always the same today.
+If we later add price improvement, the public execution event should carry both displayed price and
+actual execution price.

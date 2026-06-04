@@ -48,6 +48,10 @@ event instrument=<instrument_id> <public-book-event>
 Accepted and rejected messages are not public feed events. Resting orders, cancels, and executions
 are public because they change the visible book.
 
+Feed delivery uses bounded per-client queues. A slow subscriber can be disconnected or dropped from
+fanout when its queue fills. The matcher should continue committing book events even if a client
+cannot keep up.
+
 ## Example Cycle
 
 ```text

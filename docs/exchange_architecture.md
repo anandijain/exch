@@ -103,6 +103,17 @@ Even multicast does not make clients receive at exactly the same time, but it av
 server writes and makes the exchange publish one packet per feed channel instead of one packet per
 subscriber.
 
+The matcher must not wait for public feed clients. The correct shape is:
+
+```text
+matcher commits event -> append/enqueue feed event -> matcher continues
+fanout workers deliver queued events to clients
+```
+
+Client queues must be bounded. If a client falls behind, disconnect it or force it to resubscribe
+from a snapshot/replay point. Junk subscribers should be able to lose their own feed, but not slow
+the book.
+
 ## Kraken-Style vs ITCH-Style Feeds
 
 Kraken's public WebSocket book channel is subscription-oriented: clients ask for specific symbols

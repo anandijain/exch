@@ -2,13 +2,14 @@ use exchange_core::{BookEvent, Level, NewOrder, Price, Side, Venue, VenueConfig}
 use std::env;
 use std::error::Error;
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::{accept, Message, WebSocket};
 
 const ORDER_COMMANDS_PER_SECOND: u32 = 100;
+const FEED_CLIENT_QUEUE_CAPACITY: usize = 1024;
 
 fn main() -> std::io::Result<()> {
     let order_addr =
@@ -61,13 +62,16 @@ impl ExchangeState {
                 return true;
             }
 
-            messages
-                .iter()
-                .all(|message| subscriber.sender.send(message.clone()).is_ok())
+            messages.iter().all(
+                |message| match subscriber.sender.try_send(message.clone()) {
+                    Ok(()) => true,
+                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+                },
+            )
         });
     }
 
-    fn subscribe(&self, instrument_id: u32, sender: Sender<String>) {
+    fn subscribe(&self, instrument_id: u32, sender: SyncSender<String>) {
         self.feed_subscribers
             .lock()
             .expect("feed subscriber mutex poisoned")
@@ -80,7 +84,7 @@ impl ExchangeState {
 
 struct FeedSubscriber {
     instrument_id: u32,
-    sender: Sender<String>,
+    sender: SyncSender<String>,
 }
 
 fn default_config() -> VenueConfig {
@@ -280,7 +284,7 @@ fn subscribe_feed_ws(
         levels(&snapshot.asks)
     )))?;
 
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(FEED_CLIENT_QUEUE_CAPACITY);
     exchange.subscribe(instrument_id, sender);
 
     for message in receiver {
