@@ -130,6 +130,7 @@ struct LatencyStats {
 
 fn run_single_bin_sim(config: SimConfig) -> SimResult {
     let mut venue = Venue::new(VenueConfig::star("sim", "USD", ["AAA"]));
+    seed_sim_accounts(&mut venue, config.traders);
     let mut feed = FeedSink::new(config.feed_subscribers);
     let mut latencies = Vec::new();
     let mut private_events = 0;
@@ -164,6 +165,13 @@ fn run_single_bin_sim(config: SimConfig) -> SimResult {
         elapsed: started.elapsed(),
         matcher_elapsed,
         feed_latency: latency_stats(latencies),
+    }
+}
+
+fn seed_sim_accounts(venue: &mut Venue, traders: u64) {
+    for account_id in 1..=traders.max(1) {
+        venue.credit(account_id, "USD", 1_000_000_000_000);
+        venue.credit(account_id, "AAA", 1_000_000_000);
     }
 }
 

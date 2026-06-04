@@ -43,6 +43,7 @@ cargo run --release -p exchange_sim -- --commands 1000000 --traders 1000 --feed-
 ```
 
 See `docs/benchmarking.md` for what it measures.
+See `docs/risk_and_fees.md` for maker/taker fees, reservations, and rate limits.
 
 Run the first local WebSocket gateway:
 

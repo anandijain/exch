@@ -52,6 +52,14 @@ partition, sequence is total. Across partitions, sequence is not globally ordere
 
 This is simpler, faster, and closer to how a scalable exchange should feel.
 
+## Next Proof Work
+
+- Prove that balance transitions preserve nonnegative available and reserved balances.
+- Prove that an accepted resting order has a corresponding reservation.
+- Prove that execution spends no more than the reservations held by maker and taker.
+- Prove that fee revenue equals the sum of collected maker and taker fees.
+- Prove that public feed events are derived from committed matcher events.
+
 ## Interesting Experiments
 
 - Intentionally unbalanced symbol bins.

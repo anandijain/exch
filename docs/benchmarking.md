@@ -19,7 +19,6 @@ This intentionally excludes:
 - TCP parsing;
 - TLS;
 - authentication;
-- risk checks;
 - kernel network buffers;
 - real subscriber backpressure;
 - persistence/replay.
@@ -33,6 +32,7 @@ Useful reported values:
 - `public_events_per_sec`: events emitted into the in-process feed sink;
 - `feed_latency_ns_*`: time from matcher return to public feed sink publication.
 
-On one local release-mode run with 1,000,000 commands, 1,000 traders, and 1 feed subscriber, the
-simulator reported about 2.31M commands/sec overall, 6.73M matcher commands/sec, and 200 ns p50
-in-process feed publication latency. Treat this as a rough baseline only.
+On one local release-mode run after adding balance reservations and fee accounting, with 100,000
+commands, 1,000 traders, and 1 feed subscriber, the simulator reported about 809k commands/sec
+overall, 1.09M matcher/risk commands/sec, and 200 ns p50 in-process feed publication latency.
+Treat this as a rough baseline only.

@@ -5,6 +5,8 @@ pub type AccountId = u64;
 pub type InstrumentId = u32;
 pub type Quantity = u64;
 pub type Sequence = u64;
+pub type Amount = u128;
+pub type BasisPoints = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Price(pub u64);
@@ -29,6 +31,9 @@ pub struct Instrument {
     pub quote: Asset,
     pub price_tick: Price,
     pub quantity_step: Quantity,
+    pub min_notional: Amount,
+    pub maker_fee_bps: BasisPoints,
+    pub taker_fee_bps: BasisPoints,
 }
 
 impl Instrument {
@@ -60,6 +65,9 @@ impl VenueConfig {
                 quote: center.clone(),
                 price_tick: Price(1),
                 quantity_step: 1,
+                min_notional: 1,
+                maker_fee_bps: 0,
+                taker_fee_bps: 10,
             })
             .collect();
 
@@ -85,6 +93,9 @@ impl VenueConfig {
                     quote: assets[quote_index].clone(),
                     price_tick: Price(1),
                     quantity_step: 1,
+                    min_notional: 1,
+                    maker_fee_bps: 0,
+                    taker_fee_bps: 10,
                 });
             }
         }
@@ -123,6 +134,9 @@ impl VenueConfig {
                 quote: assets[quote_index].clone(),
                 price_tick: Price(1),
                 quantity_step: 1,
+                min_notional: 1,
+                maker_fee_bps: 0,
+                taker_fee_bps: 10,
             })
             .collect();
 
@@ -174,6 +188,9 @@ pub struct NewOrder {
 pub struct Venue {
     config: VenueConfig,
     books: BTreeMap<InstrumentId, OrderBook>,
+    accounts: BTreeMap<AccountId, Account>,
+    order_reservations: BTreeMap<OrderId, Reservation>,
+    revenue: BTreeMap<String, Amount>,
 }
 
 impl Venue {
@@ -184,7 +201,13 @@ impl Venue {
             .map(|instrument| (instrument.id, OrderBook::new()))
             .collect();
 
-        Self { config, books }
+        Self {
+            config,
+            books,
+            accounts: BTreeMap::new(),
+            order_reservations: BTreeMap::new(),
+            revenue: BTreeMap::new(),
+        }
     }
 
     pub fn config(&self) -> &VenueConfig {
@@ -196,8 +219,18 @@ impl Venue {
         instrument_id: InstrumentId,
         order: NewOrder,
     ) -> Result<Vec<BookEvent>, VenueError> {
-        self.book_mut(instrument_id)
-            .map(|book| book.submit_limit(order))
+        let instrument = self.instrument(instrument_id)?.clone();
+        let reject_reason = self.validate_order(&instrument, &order);
+        if let Some(reason) = reject_reason {
+            return self
+                .book_mut(instrument_id)
+                .map(|book| vec![book.reject(order.order_id, reason)]);
+        }
+
+        let reservation = self.reserve_for_order(&instrument, &order);
+        let events = self.book_mut(instrument_id)?.submit_limit(order.clone());
+        self.apply_economics(&instrument, &order, &events, reservation);
+        Ok(events)
     }
 
     pub fn cancel(
@@ -205,8 +238,11 @@ impl Venue {
         instrument_id: InstrumentId,
         order_id: OrderId,
     ) -> Result<BookEvent, VenueError> {
-        self.book_mut(instrument_id)
-            .map(|book| book.cancel(order_id))
+        let event = self.book_mut(instrument_id)?.cancel(order_id);
+        if let BookEvent::Canceled { quantity, .. } = event {
+            self.release_reservation(order_id, quantity);
+        }
+        Ok(event)
     }
 
     pub fn snapshot(
@@ -225,11 +261,293 @@ impl Venue {
             .get_mut(&instrument_id)
             .ok_or(VenueError::UnknownInstrument)
     }
+
+    fn instrument(&self, instrument_id: InstrumentId) -> Result<&Instrument, VenueError> {
+        self.config
+            .instruments
+            .iter()
+            .find(|instrument| instrument.id == instrument_id)
+            .ok_or(VenueError::UnknownInstrument)
+    }
+
+    pub fn credit(&mut self, account_id: AccountId, asset: impl Into<String>, amount: Amount) {
+        self.account_mut(account_id).credit(asset.into(), amount);
+    }
+
+    pub fn balance(&self, account_id: AccountId, asset: &str) -> Amount {
+        self.accounts
+            .get(&account_id)
+            .map(|account| account.available(asset))
+            .unwrap_or(0)
+    }
+
+    pub fn reserved(&self, account_id: AccountId, asset: &str) -> Amount {
+        self.accounts
+            .get(&account_id)
+            .map(|account| account.reserved(asset))
+            .unwrap_or(0)
+    }
+
+    pub fn revenue(&self, asset: &str) -> Amount {
+        self.revenue.get(asset).copied().unwrap_or(0)
+    }
+
+    fn validate_order(&self, instrument: &Instrument, order: &NewOrder) -> Option<RejectReason> {
+        if order.quantity == 0 {
+            return Some(RejectReason::ZeroQuantity);
+        }
+        if order.price.0 == 0 {
+            return Some(RejectReason::ZeroPrice);
+        }
+        if order.price.0 % instrument.price_tick.0 != 0 {
+            return Some(RejectReason::InvalidPriceTick);
+        }
+        if order.quantity % instrument.quantity_step != 0 {
+            return Some(RejectReason::InvalidQuantityStep);
+        }
+        let notional = notional(order.price, order.quantity);
+        if notional < instrument.min_notional {
+            return Some(RejectReason::BelowMinNotional);
+        }
+        if self.order_reservations.contains_key(&order.order_id) {
+            return Some(RejectReason::DuplicateOrderId);
+        }
+        if !self.has_available_for_order(instrument, order) {
+            return Some(RejectReason::InsufficientAvailableBalance);
+        }
+        None
+    }
+
+    fn has_available_for_order(&self, instrument: &Instrument, order: &NewOrder) -> bool {
+        let Some(account) = self.accounts.get(&order.account_id) else {
+            return false;
+        };
+        let reservation = Reservation::for_order(instrument, order);
+        account.available(&reservation.asset) >= reservation.amount
+    }
+
+    fn reserve_for_order(&mut self, instrument: &Instrument, order: &NewOrder) -> Reservation {
+        let reservation = Reservation::for_order(instrument, order);
+        self.account_mut(order.account_id)
+            .reserve(&reservation.asset, reservation.amount);
+        self.order_reservations
+            .insert(order.order_id, reservation.clone());
+        reservation
+    }
+
+    fn apply_economics(
+        &mut self,
+        instrument: &Instrument,
+        order: &NewOrder,
+        events: &[BookEvent],
+        reservation: Reservation,
+    ) {
+        let mut executed_quantity = 0;
+        let mut consumed_reservation = 0;
+
+        for event in events {
+            if let BookEvent::Executed { execution, .. } = event {
+                executed_quantity += execution.quantity;
+                consumed_reservation += consumed_by_incoming(instrument, order.side, execution);
+                self.apply_execution(instrument, order, execution);
+            }
+        }
+
+        let remaining_quantity = order.quantity - executed_quantity;
+        let remaining_reservation = reservation.scale(remaining_quantity, order.quantity);
+        let release = reservation
+            .amount
+            .saturating_sub(consumed_reservation + remaining_reservation.amount);
+
+        if release > 0 {
+            self.account_mut(order.account_id)
+                .release(&reservation.asset, release);
+        }
+
+        if remaining_quantity == 0 {
+            self.order_reservations.remove(&order.order_id);
+        } else if executed_quantity > 0 {
+            self.order_reservations
+                .insert(order.order_id, remaining_reservation);
+        }
+    }
+
+    fn apply_execution(
+        &mut self,
+        instrument: &Instrument,
+        incoming: &NewOrder,
+        execution: &Execution,
+    ) {
+        let Some(resting_reservation) = self
+            .order_reservations
+            .get(&execution.resting_order_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        let trade_notional = notional(execution.price, execution.quantity);
+        let maker_fee = fee(trade_notional, instrument.maker_fee_bps);
+        let taker_fee = fee(trade_notional, instrument.taker_fee_bps);
+
+        let resting_order_id = execution.resting_order_id;
+        let maker_account_id = resting_reservation.account_id;
+        let taker_account_id = incoming.account_id;
+        let quote = instrument.quote.symbol.clone();
+        let base = instrument.base.symbol.clone();
+
+        match incoming.side {
+            Side::Buy => {
+                self.account_mut(taker_account_id)
+                    .spend_reserved(&quote, trade_notional + taker_fee);
+                self.account_mut(taker_account_id)
+                    .credit(base.clone(), execution.quantity as Amount);
+                self.account_mut(maker_account_id)
+                    .spend_reserved(&base, execution.quantity as Amount);
+                self.account_mut(maker_account_id)
+                    .credit(quote.clone(), trade_notional.saturating_sub(maker_fee));
+                self.add_revenue(quote, maker_fee + taker_fee);
+            }
+            Side::Sell => {
+                self.account_mut(taker_account_id)
+                    .spend_reserved(&base, execution.quantity as Amount);
+                self.account_mut(taker_account_id)
+                    .credit(quote.clone(), trade_notional.saturating_sub(taker_fee));
+                self.account_mut(maker_account_id)
+                    .spend_reserved(&quote, trade_notional + maker_fee);
+                self.account_mut(maker_account_id)
+                    .credit(base, execution.quantity as Amount);
+                self.add_revenue(quote, maker_fee + taker_fee);
+            }
+        }
+
+        self.decrease_reservation(resting_order_id, execution.quantity);
+    }
+
+    fn decrease_reservation(&mut self, order_id: OrderId, executed_quantity: Quantity) {
+        let Some(reservation) = self.order_reservations.get(&order_id).cloned() else {
+            return;
+        };
+        if executed_quantity >= reservation.quantity {
+            self.order_reservations.remove(&order_id);
+        } else {
+            let remaining = reservation.quantity - executed_quantity;
+            self.order_reservations
+                .insert(order_id, reservation.scale(remaining, reservation.quantity));
+        }
+    }
+
+    fn release_reservation(&mut self, order_id: OrderId, canceled_quantity: Quantity) {
+        let Some(reservation) = self.order_reservations.remove(&order_id) else {
+            return;
+        };
+        let release = reservation.scale(canceled_quantity, reservation.quantity);
+        self.account_mut(reservation.account_id)
+            .release(&release.asset, release.amount);
+    }
+
+    fn account_mut(&mut self, account_id: AccountId) -> &mut Account {
+        self.accounts.entry(account_id).or_default()
+    }
+
+    fn add_revenue(&mut self, asset: String, amount: Amount) {
+        *self.revenue.entry(asset).or_default() += amount;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VenueError {
     UnknownInstrument,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Account {
+    balances: BTreeMap<String, AssetBalance>,
+}
+
+impl Account {
+    pub fn available(&self, asset: &str) -> Amount {
+        self.balances
+            .get(asset)
+            .map(|balance| balance.available)
+            .unwrap_or(0)
+    }
+
+    pub fn reserved(&self, asset: &str) -> Amount {
+        self.balances
+            .get(asset)
+            .map(|balance| balance.reserved)
+            .unwrap_or(0)
+    }
+
+    fn credit(&mut self, asset: String, amount: Amount) {
+        self.balances.entry(asset).or_default().available += amount;
+    }
+
+    fn reserve(&mut self, asset: &str, amount: Amount) {
+        let balance = self.balances.entry(asset.to_string()).or_default();
+        balance.available -= amount;
+        balance.reserved += amount;
+    }
+
+    fn release(&mut self, asset: &str, amount: Amount) {
+        let balance = self.balances.entry(asset.to_string()).or_default();
+        balance.reserved -= amount;
+        balance.available += amount;
+    }
+
+    fn spend_reserved(&mut self, asset: &str, amount: Amount) {
+        self.balances.entry(asset.to_string()).or_default().reserved -= amount;
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AssetBalance {
+    available: Amount,
+    reserved: Amount,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reservation {
+    account_id: AccountId,
+    asset: String,
+    amount: Amount,
+    quantity: Quantity,
+}
+
+impl Reservation {
+    fn for_order(instrument: &Instrument, order: &NewOrder) -> Self {
+        let amount = match order.side {
+            Side::Buy => {
+                notional(order.price, order.quantity)
+                    + fee(
+                        notional(order.price, order.quantity),
+                        instrument.taker_fee_bps,
+                    )
+            }
+            Side::Sell => order.quantity as Amount,
+        };
+        let asset = match order.side {
+            Side::Buy => instrument.quote.symbol.clone(),
+            Side::Sell => instrument.base.symbol.clone(),
+        };
+
+        Self {
+            account_id: order.account_id,
+            asset,
+            amount,
+            quantity: order.quantity,
+        }
+    }
+
+    fn scale(&self, quantity: Quantity, original_quantity: Quantity) -> Self {
+        Self {
+            account_id: self.account_id,
+            asset: self.asset.clone(),
+            amount: self.amount * quantity as Amount / original_quantity as Amount,
+            quantity,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +601,11 @@ pub enum RejectReason {
     DuplicateOrderId,
     UnknownOrderId,
     ZeroQuantity,
+    ZeroPrice,
+    InvalidPriceTick,
+    InvalidQuantityStep,
+    BelowMinNotional,
+    InsufficientAvailableBalance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,6 +880,28 @@ impl OrderBook {
             reason,
         }
     }
+
+    fn reject(&mut self, order_id: OrderId, reason: RejectReason) -> BookEvent {
+        self.rejected(order_id, reason)
+    }
+}
+
+fn notional(price: Price, quantity: Quantity) -> Amount {
+    price.0 as Amount * quantity as Amount
+}
+
+fn fee(notional: Amount, fee_bps: BasisPoints) -> Amount {
+    notional * fee_bps as Amount / 10_000
+}
+
+fn consumed_by_incoming(instrument: &Instrument, side: Side, execution: &Execution) -> Amount {
+    match side {
+        Side::Buy => {
+            let trade_notional = notional(execution.price, execution.quantity);
+            trade_notional + fee(trade_notional, instrument.taker_fee_bps)
+        }
+        Side::Sell => execution.quantity as Amount,
+    }
 }
 
 pub fn checksum(bids: &[Level], asks: &[Level]) -> u32 {
@@ -774,10 +1119,77 @@ mod tests {
         assert_eq!(left.instruments.len(), 4);
     }
 
+    #[test]
+    fn venue_rejects_order_without_available_balance() {
+        let mut venue = Venue::new(VenueConfig::star("equities", "USD", ["AAA"]));
+
+        let events = venue
+            .submit_limit(0, order(1, Side::Buy, 100, 10))
+            .expect("instrument exists");
+
+        assert!(matches!(
+            events[0],
+            BookEvent::Rejected {
+                reason: RejectReason::InsufficientAvailableBalance,
+                ..
+            }
+        ));
+        assert!(venue.snapshot(0, 10).expect("snapshot").bids.is_empty());
+    }
+
+    #[test]
+    fn venue_reserves_buy_notional_and_releases_on_cancel() {
+        let mut venue = Venue::new(VenueConfig::star("equities", "USD", ["AAA"]));
+        venue.credit(1, "USD", 1_001);
+
+        venue
+            .submit_limit(0, order(1, Side::Buy, 100, 10))
+            .expect("instrument exists");
+
+        assert_eq!(venue.balance(1, "USD"), 0);
+        assert_eq!(venue.reserved(1, "USD"), 1_001);
+
+        venue.cancel(0, 1).expect("cancel");
+
+        assert_eq!(venue.balance(1, "USD"), 1_001);
+        assert_eq!(venue.reserved(1, "USD"), 0);
+    }
+
+    #[test]
+    fn venue_collects_taker_fee_on_execution() {
+        let mut venue = Venue::new(VenueConfig::star("equities", "USD", ["AAA"]));
+        venue.credit(1, "AAA", 10);
+        venue.credit(2, "USD", 1_010);
+
+        venue
+            .submit_limit(0, order(1, Side::Sell, 100, 10))
+            .expect("sell rests");
+        venue
+            .submit_limit(0, order_for_account(2, 2, Side::Buy, 100, 10))
+            .expect("buy executes");
+
+        assert_eq!(venue.balance(1, "USD"), 1_000);
+        assert_eq!(venue.balance(2, "AAA"), 10);
+        assert_eq!(venue.revenue("USD"), 1);
+        assert_eq!(venue.balance(2, "USD"), 9);
+        assert_eq!(venue.reserved(1, "AAA"), 0);
+        assert_eq!(venue.reserved(2, "USD"), 0);
+    }
+
     fn order(order_id: OrderId, side: Side, price: u64, quantity: Quantity) -> NewOrder {
+        order_for_account(1, order_id, side, price, quantity)
+    }
+
+    fn order_for_account(
+        account_id: AccountId,
+        order_id: OrderId,
+        side: Side,
+        price: u64,
+        quantity: Quantity,
+    ) -> NewOrder {
         NewOrder {
             order_id,
-            account_id: 1,
+            account_id,
             side,
             price: Price(price),
             quantity,

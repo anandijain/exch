@@ -28,6 +28,23 @@ structure Book where
   asks : List Level
 deriving DecidableEq, Repr
 
+structure Balance where
+  available : Nat
+  reserved : Nat
+deriving DecidableEq, Repr
+
+def totalBalance (balance : Balance) : Nat :=
+  balance.available + balance.reserved
+
+def reserve (balance : Balance) (amount : Nat) : Option Balance :=
+  if proof : amount ≤ balance.available then
+    some {
+      available := balance.available - amount
+      reserved := balance.reserved + amount
+    }
+  else
+    none
+
 def strictlyDescendingPrices : List Level -> Prop
   | [] => True
   | [_] => True
@@ -55,3 +72,18 @@ def validBook (book : Book) : Prop :=
 
 theorem emptyBookValid : validBook { bids := [], asks := [] } := by
   repeat constructor
+
+theorem reservePreservesTotal
+    (balance : Balance)
+    (amount : Nat)
+    (updated : Balance)
+    (h : reserve balance amount = some updated) :
+    totalBalance updated = totalBalance balance := by
+  unfold reserve at h
+  by_cases hle : amount ≤ balance.available
+  · simp [hle] at h
+    injection h with hupdated
+    rw [← hupdated]
+    unfold totalBalance
+    omega
+  · simp [hle] at h

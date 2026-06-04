@@ -5,7 +5,10 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tungstenite::{accept, Message, WebSocket};
+
+const ORDER_COMMANDS_PER_SECOND: u32 = 100;
 
 fn main() -> std::io::Result<()> {
     let order_addr =
@@ -30,8 +33,10 @@ struct ExchangeState {
 
 impl ExchangeState {
     fn new(config: VenueConfig) -> Self {
+        let mut venue = Venue::new(config);
+        seed_demo_accounts(&mut venue);
         Self {
-            venue: Mutex::new(Venue::new(config)),
+            venue: Mutex::new(venue),
             feed_subscribers: Mutex::new(Vec::new()),
         }
     }
@@ -86,6 +91,15 @@ fn default_config() -> VenueConfig {
     )
 }
 
+fn seed_demo_accounts(venue: &mut Venue) {
+    for account_id in 1..=1_000 {
+        venue.credit(account_id, "USD", 1_000_000_000);
+        for asset in ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"] {
+            venue.credit(account_id, asset, 1_000_000);
+        }
+    }
+}
+
 fn listen_order_ws(addr: &str, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     println!("order websocket listening on ws://{addr}");
@@ -124,6 +138,7 @@ type WsHandlerResult = Result<(), Box<dyn Error + Send + Sync>>;
 
 fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandlerResult {
     let mut socket = accept(stream)?;
+    let mut rate_limit = RateLimit::per_second(ORDER_COMMANDS_PER_SECOND);
     socket.send(Message::Text(
         "ok hello protocol=exch-ws-order commands=instruments,book,order,cancel,help".to_string(),
     ))?;
@@ -138,8 +153,42 @@ fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandler
             continue;
         }
 
-        let response = handle_order_command(message.to_text()?, &exchange);
+        let response = if rate_limit.allow() {
+            handle_order_command(message.to_text()?, &exchange)
+        } else {
+            "error rate-limit-exceeded".to_string()
+        };
         socket.send(Message::Text(response))?;
+    }
+}
+
+struct RateLimit {
+    limit: u32,
+    window_started: Instant,
+    used: u32,
+}
+
+impl RateLimit {
+    fn per_second(limit: u32) -> Self {
+        Self {
+            limit,
+            window_started: Instant::now(),
+            used: 0,
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            self.window_started = Instant::now();
+            self.used = 0;
+        }
+
+        if self.used >= self.limit {
+            return false;
+        }
+
+        self.used += 1;
+        true
     }
 }
 

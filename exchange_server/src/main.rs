@@ -5,6 +5,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+const ORDER_COMMANDS_PER_SECOND: u32 = 100;
 
 fn main() -> std::io::Result<()> {
     let order_addr = env::var("EXCH_ORDER_ADDR").unwrap_or_else(|_| "127.0.0.1:7001".to_string());
@@ -28,8 +31,10 @@ struct ExchangeState {
 
 impl ExchangeState {
     fn new(config: VenueConfig) -> Self {
+        let mut venue = Venue::new(config);
+        seed_demo_accounts(&mut venue);
         Self {
-            venue: Mutex::new(Venue::new(config)),
+            venue: Mutex::new(venue),
             feed_subscribers: Mutex::new(Vec::new()),
         }
     }
@@ -122,9 +127,19 @@ fn default_config() -> VenueConfig {
     )
 }
 
+fn seed_demo_accounts(venue: &mut Venue) {
+    for account_id in 1..=1_000 {
+        venue.credit(account_id, "USD", 1_000_000_000);
+        for asset in ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"] {
+            venue.credit(account_id, asset, 1_000_000);
+        }
+    }
+}
+
 fn handle_order_client(stream: TcpStream, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
+    let mut rate_limit = RateLimit::per_second(ORDER_COMMANDS_PER_SECOND);
 
     writeln!(
         writer,
@@ -133,11 +148,45 @@ fn handle_order_client(stream: TcpStream, exchange: Arc<ExchangeState>) -> std::
 
     for line in reader.lines() {
         let line = line?;
-        let response = handle_order_command(&line, &exchange);
+        let response = if rate_limit.allow() {
+            handle_order_command(&line, &exchange)
+        } else {
+            "error rate-limit-exceeded".to_string()
+        };
         writeln!(writer, "{response}")?;
     }
 
     Ok(())
+}
+
+struct RateLimit {
+    limit: u32,
+    window_started: Instant,
+    used: u32,
+}
+
+impl RateLimit {
+    fn per_second(limit: u32) -> Self {
+        Self {
+            limit,
+            window_started: Instant::now(),
+            used: 0,
+        }
+    }
+
+    fn allow(&mut self) -> bool {
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            self.window_started = Instant::now();
+            self.used = 0;
+        }
+
+        if self.used >= self.limit {
+            return false;
+        }
+
+        self.used += 1;
+        true
+    }
 }
 
 fn handle_feed_client(stream: TcpStream, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
