@@ -2,21 +2,111 @@ use exchange_core::{BookEvent, Level, NewOrder, Price, Side, Venue, VenueConfig}
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 fn main() -> std::io::Result<()> {
-    let addr = env::var("EXCH_ADDR").unwrap_or_else(|_| "127.0.0.1:7001".to_string());
-    let venue = Arc::new(Mutex::new(Venue::new(default_config())));
-    let listener = TcpListener::bind(&addr)?;
+    let order_addr = env::var("EXCH_ORDER_ADDR").unwrap_or_else(|_| "127.0.0.1:7001".to_string());
+    let feed_addr = env::var("EXCH_FEED_ADDR").unwrap_or_else(|_| "127.0.0.1:7002".to_string());
+    let exchange = Arc::new(ExchangeState::new(default_config()));
 
-    println!("exchange_server listening on {addr}");
+    let feed_exchange = Arc::clone(&exchange);
+    let feed_thread = thread::spawn(move || listen_feed(&feed_addr, feed_exchange));
+
+    listen_order_entry(&order_addr, exchange)?;
+    feed_thread
+        .join()
+        .expect("feed listener thread panicked")
+        .map(|_| ())
+}
+
+struct ExchangeState {
+    venue: Mutex<Venue>,
+    feed_subscribers: Mutex<Vec<FeedSubscriber>>,
+}
+
+impl ExchangeState {
+    fn new(config: VenueConfig) -> Self {
+        Self {
+            venue: Mutex::new(Venue::new(config)),
+            feed_subscribers: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn publish(&self, instrument_id: u32, events: &[BookEvent]) {
+        if events.is_empty() {
+            return;
+        }
+
+        let messages = events
+            .iter()
+            .filter(|event| is_public_feed_event(event))
+            .map(|event| format!("event instrument={instrument_id} {}", event_line(event)))
+            .collect::<Vec<_>>();
+
+        if messages.is_empty() {
+            return;
+        }
+
+        let mut subscribers = self
+            .feed_subscribers
+            .lock()
+            .expect("feed subscriber mutex poisoned");
+        subscribers.retain(|subscriber| {
+            if subscriber.instrument_id != instrument_id {
+                return true;
+            }
+
+            messages
+                .iter()
+                .all(|message| subscriber.sender.send(message.clone()).is_ok())
+        });
+    }
+
+    fn subscribe(&self, instrument_id: u32, sender: Sender<String>) {
+        self.feed_subscribers
+            .lock()
+            .expect("feed subscriber mutex poisoned")
+            .push(FeedSubscriber {
+                instrument_id,
+                sender,
+            });
+    }
+}
+
+struct FeedSubscriber {
+    instrument_id: u32,
+    sender: Sender<String>,
+}
+
+fn listen_order_entry(addr: &str, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+
+    println!("order entry listening on {addr}");
     for stream in listener.incoming() {
         let stream = stream?;
-        let venue = Arc::clone(&venue);
+        let exchange = Arc::clone(&exchange);
         thread::spawn(move || {
-            if let Err(error) = handle_client(stream, venue) {
-                eprintln!("client error: {error}");
+            if let Err(error) = handle_order_client(stream, exchange) {
+                eprintln!("order client error: {error}");
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn listen_feed(addr: &str, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
+    let listener = TcpListener::bind(addr)?;
+
+    println!("market data feed listening on {addr}");
+    for stream in listener.incoming() {
+        let stream = stream?;
+        let exchange = Arc::clone(&exchange);
+        thread::spawn(move || {
+            if let Err(error) = handle_feed_client(stream, exchange) {
+                eprintln!("feed client error: {error}");
             }
         });
     }
@@ -32,25 +122,119 @@ fn default_config() -> VenueConfig {
     )
 }
 
-fn handle_client(stream: TcpStream, venue: Arc<Mutex<Venue>>) -> std::io::Result<()> {
+fn handle_order_client(stream: TcpStream, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
 
     writeln!(
         writer,
-        "ok hello protocol=exch-lines commands=instruments,book,order,cancel,help"
+        "ok hello protocol=exch-order-entry commands=instruments,book,order,cancel,help"
     )?;
 
     for line in reader.lines() {
         let line = line?;
-        let response = handle_command(&line, &venue);
+        let response = handle_order_command(&line, &exchange);
         writeln!(writer, "{response}")?;
     }
 
     Ok(())
 }
 
-fn handle_command(line: &str, venue: &Arc<Mutex<Venue>>) -> String {
+fn handle_feed_client(stream: TcpStream, exchange: Arc<ExchangeState>) -> std::io::Result<()> {
+    let mut writer = stream.try_clone()?;
+    let reader = BufReader::new(stream);
+
+    writeln!(
+        writer,
+        "ok hello protocol=exch-market-data commands=subscribe,help"
+    )?;
+
+    for line in reader.lines() {
+        let line = line?;
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+
+        match parts.as_slice() {
+            ["help"] => writeln!(writer, "ok help subscribe <instrument_id> [depth]")?,
+            ["subscribe", instrument_id] => {
+                subscribe_feed(*instrument_id, None, &exchange, &mut writer)?;
+                break;
+            }
+            ["subscribe", instrument_id, depth] => {
+                subscribe_feed(*instrument_id, Some(*depth), &exchange, &mut writer)?;
+                break;
+            }
+            _ => writeln!(writer, "error usage subscribe <instrument_id> [depth]")?,
+        }
+    }
+
+    Ok(())
+}
+
+fn subscribe_feed(
+    instrument_id: &str,
+    depth: Option<&str>,
+    exchange: &Arc<ExchangeState>,
+    writer: &mut TcpStream,
+) -> std::io::Result<()> {
+    let Some(instrument_id) = parse(instrument_id, "instrument_id") else {
+        writeln!(writer, "error invalid-instrument-id")?;
+        return Ok(());
+    };
+    let depth = match depth {
+        Some(depth) => {
+            let Some(depth) = parse(depth, "depth") else {
+                writeln!(writer, "error invalid-depth")?;
+                return Ok(());
+            };
+            depth
+        }
+        None => {
+            exchange
+                .venue
+                .lock()
+                .expect("venue mutex poisoned")
+                .config()
+                .default_snapshot_depth
+        }
+    };
+
+    let snapshot = match exchange
+        .venue
+        .lock()
+        .expect("venue mutex poisoned")
+        .snapshot(instrument_id, depth)
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            writeln!(writer, "error unknown-instrument")?;
+            return Ok(());
+        }
+    };
+
+    writeln!(
+        writer,
+        "ok subscribed instrument={instrument_id} depth={depth}"
+    )?;
+    writeln!(
+        writer,
+        "snapshot instrument={instrument_id} seq={} checksum={} bids={} asks={}",
+        snapshot.seq,
+        snapshot.checksum,
+        levels(&snapshot.bids),
+        levels(&snapshot.asks)
+    )?;
+
+    let (sender, receiver) = mpsc::channel();
+    exchange.subscribe(instrument_id, sender);
+
+    for message in receiver {
+        writeln!(writer, "{message}")?;
+    }
+
+    Ok(())
+}
+
+fn handle_order_command(line: &str, exchange: &Arc<ExchangeState>) -> String {
     let parts = line.split_whitespace().collect::<Vec<_>>();
     let Some(command) = parts.first().copied() else {
         return "error empty-command".to_string();
@@ -58,10 +242,10 @@ fn handle_command(line: &str, venue: &Arc<Mutex<Venue>>) -> String {
 
     match command {
         "help" => help(),
-        "instruments" => instruments(venue),
-        "book" => book(&parts, venue),
-        "order" => order(&parts, venue),
-        "cancel" => cancel(&parts, venue),
+        "instruments" => instruments(exchange),
+        "book" => book(&parts, exchange),
+        "order" => order(&parts, exchange),
+        "cancel" => cancel(&parts, exchange),
         _ => format!("error unknown-command command={command}"),
     }
 }
@@ -70,8 +254,8 @@ fn help() -> String {
     "ok help instruments | book <instrument_id> [depth] | order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity> | cancel <instrument_id> <order_id>".to_string()
 }
 
-fn instruments(venue: &Arc<Mutex<Venue>>) -> String {
-    let venue = venue.lock().expect("venue mutex poisoned");
+fn instruments(exchange: &Arc<ExchangeState>) -> String {
+    let venue = exchange.venue.lock().expect("venue mutex poisoned");
     let instruments = venue
         .config()
         .instruments
@@ -83,7 +267,7 @@ fn instruments(venue: &Arc<Mutex<Venue>>) -> String {
     format!("ok instruments venue={} {instruments}", venue.config().name)
 }
 
-fn book(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
+fn book(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
     if parts.len() < 2 || parts.len() > 3 {
         return "error usage book <instrument_id> [depth]".to_string();
     }
@@ -97,14 +281,16 @@ fn book(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
         };
         depth
     } else {
-        venue
+        exchange
+            .venue
             .lock()
             .expect("venue mutex poisoned")
             .config()
             .default_snapshot_depth
     };
 
-    match venue
+    match exchange
+        .venue
         .lock()
         .expect("venue mutex poisoned")
         .snapshot(instrument_id, depth)
@@ -120,7 +306,7 @@ fn book(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
     }
 }
 
-fn order(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
+fn order(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
     if parts.len() != 7 {
         return "error usage order <instrument_id> <order_id> <account_id> <buy|sell> <price> <quantity>".to_string();
     }
@@ -152,20 +338,28 @@ fn order(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
         quantity,
     };
 
-    match venue
+    match exchange
+        .venue
         .lock()
         .expect("venue mutex poisoned")
         .submit_limit(instrument_id, order)
     {
-        Ok(events) => format!(
-            "ok events {}",
-            events.iter().map(event).collect::<Vec<_>>().join("|")
-        ),
+        Ok(events) => {
+            exchange.publish(instrument_id, &events);
+            format!(
+                "ok events {}",
+                events
+                    .iter()
+                    .map(private_event)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            )
+        }
         Err(_) => "error unknown-instrument".to_string(),
     }
 }
 
-fn cancel(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
+fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
     if parts.len() != 3 {
         return "error usage cancel <instrument_id> <order_id>".to_string();
     }
@@ -177,12 +371,16 @@ fn cancel(parts: &[&str], venue: &Arc<Mutex<Venue>>) -> String {
         return "error invalid-order-id".to_string();
     };
 
-    match venue
+    match exchange
+        .venue
         .lock()
         .expect("venue mutex poisoned")
         .cancel(instrument_id, order_id)
     {
-        Ok(book_event) => format!("ok events {}", event(&book_event)),
+        Ok(book_event) => {
+            exchange.publish(instrument_id, std::slice::from_ref(&book_event));
+            format!("ok events {}", private_event(&book_event))
+        }
         Err(_) => "error unknown-instrument".to_string(),
     }
 }
@@ -203,9 +401,28 @@ fn levels(levels: &[Level]) -> String {
         .join(",")
 }
 
-fn event(event: &BookEvent) -> String {
+fn is_public_feed_event(event: &BookEvent) -> bool {
+    !matches!(
+        event,
+        BookEvent::Accepted { .. } | BookEvent::Rejected { .. }
+    )
+}
+
+fn private_event(event: &BookEvent) -> String {
     match event {
-        BookEvent::Accepted { seq, order_id } => format!("accepted:{seq}:{order_id}"),
+        BookEvent::Accepted { seq, order_id } => format!("accepted:{seq}:order={order_id}"),
+        BookEvent::Rejected {
+            seq,
+            order_id,
+            reason,
+        } => format!("rejected:{seq}:order={order_id}:reason={reason:?}"),
+        event => event_line(event),
+    }
+}
+
+fn event_line(event: &BookEvent) -> String {
+    match event {
+        BookEvent::Accepted { seq, order_id } => format!("accepted:{seq}:order={order_id}"),
         BookEvent::Executed { seq, execution } => format!(
             "executed:{seq}:resting={}:aggressing={}:qty={}:price={}",
             execution.resting_order_id,

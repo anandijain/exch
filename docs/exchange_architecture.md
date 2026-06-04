@@ -23,6 +23,27 @@ For this project:
 - The same core `BookEvent` should feed both private order responses and public book updates, but
   those should be delivered over separate channels.
 
+## UDP Multicast
+
+UDP is a connectionless packet protocol. Unlike TCP, it does not promise delivery, ordering, or
+retransmission. Multicast is a network delivery mode where one sender publishes packets to a
+multicast group address and many receivers can subscribe to that group. The sender does not open a
+separate connection per subscriber.
+
+That makes UDP multicast a natural fit for exchange market data:
+
+- the same packet can reach many subscribers;
+- a slow subscriber does not directly slow the publisher;
+- packet loss is visible through sequence gaps;
+- recovery can be handled separately through replay or snapshot services.
+
+It is not a good fit for order entry. Order entry needs private, authenticated, reliable,
+participant-specific responses. That is why the local project should model:
+
+- order entry as point-to-point TCP first;
+- market data as TCP fanout first;
+- later market data as UDP multicast plus snapshot/replay.
+
 ## Sequencing and Fairness
 
 Matching for a single instrument should be serial. There is one authoritative order of accepted
@@ -44,6 +65,36 @@ For this project:
 Network arrival is not the same thing as fairness. The exchange chooses a concrete acceptance point:
 for example, the order in which a gateway reads valid messages and submits them to the sequencer.
 That acceptance order is the order the matching engine sees.
+
+## Pre-Trade Risk and Negative Capital
+
+A trader can absolutely have stale local state. They may send an order after earlier executions
+have happened but before their client has processed the private execution report or public market
+data update.
+
+The exchange should not trust the trader's local book or local capital calculation. The exchange,
+broker, clearing layer, or a pre-trade risk gateway keeps authoritative account/risk state and
+checks each incoming order before it reaches matching.
+
+For this project, model risk checks as a pre-matcher stage:
+
+```text
+network read -> decode -> authenticate -> risk/limits -> sequencer -> matcher -> private/public events
+```
+
+If an order would exceed buying power, position limits, max order size, or other configured limits,
+it should be rejected before matching. The trader later receives a private reject. Public market
+data subscribers see nothing because the order never touched the book.
+
+Outstanding order notional is usually part of the risk calculation. A simple cash account model can
+reserve buying power when a buy order is accepted, release it on cancel, and convert it into a
+position/cash change on execution. A margin or broker-sponsored access model can be more complex,
+but the same idea holds: risk state must include live orders, not only completed trades.
+
+In US equities market access, SEC Rule 15c3-5 requires broker-dealers with market access to maintain
+risk management controls reasonably designed to systematically limit financial exposure, including
+pre-set credit or capital thresholds. We should copy that design shape, even though this project is
+a mock exchange and not legal/compliance software.
 
 ## Fixed-Point Integers
 
