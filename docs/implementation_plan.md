@@ -70,3 +70,10 @@ This is simpler, faster, and closer to how a scalable exchange should feel.
 - Single-bin throughput.
   Keep all symbols in one serial matcher and measure accepted commands per second, public feed
   events per second, and matcher-to-feed publication latency.
+
+- Trader-created physically delivered contracts.
+  Let traders propose simple futures-like markets with deterministic settlement: base asset, quote
+  asset, contract size, fixed expiry, tick size, and full collateral requirements. For electronic
+  assets/currencies, physical delivery can be easier than cash settlement because the exchange can
+  reserve deliverable assets up front and transfer them at expiry without needing an external
+  settlement-price oracle.
