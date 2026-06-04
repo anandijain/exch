@@ -35,6 +35,7 @@ rejects, cancels, and executions for that connection's commands.
 
 ```text
 help
+replay <instrument_id> <after_seq>
 subscribe <instrument_id> [depth]
 ```
 
@@ -51,6 +52,18 @@ are public because they change the visible book.
 Feed delivery uses bounded per-client queues. A slow subscriber can be disconnected or dropped from
 fanout when its queue fills. The matcher should continue committing book events even if a client
 cannot keep up.
+
+Replay returns public feed events with sequence numbers greater than `after_seq`:
+
+```text
+replay 0 120
+ok replay instrument=0 after_seq=120 count=2
+event instrument=0 executed:121:...
+event instrument=0 rested:122:...
+```
+
+The current replay log is in-memory and resets when the server restarts. Public deployment needs a
+persistent feed log.
 
 ## Example Cycle
 
@@ -103,4 +116,11 @@ after connecting. Once authenticated, order/account commands use the account map
 order <instrument_id> <order_id> <buy|sell> <price> <quantity>
 replace <instrument_id> <old_order_id> <new_order_id> <buy|sell> <price> <quantity>
 account <asset>
+```
+
+The next public protocol revision should switch from these text commands to JSON messages while
+preserving the same semantics. For example:
+
+```json
+{"type":"order","instrument":0,"order_id":1,"side":"buy","price":10000,"quantity":25}
 ```

@@ -13,13 +13,16 @@ fn websocket_order_and_feed_cycle() {
     let result = run_cycle(order_addr, feed_addr);
     stop_server(&mut server);
 
-    let (sell_ack, feed_event_1, buy_ack, feed_event_2, revenue) = result;
+    let (sell_ack, feed_event_1, buy_ack, feed_event_2, replay_event_1, replay_event_2, revenue) =
+        result;
     assert!(sell_ack.contains("accepted:1:order=1"));
     assert!(sell_ack.contains("rested:2:order=1"));
     assert!(feed_event_1.contains("rested:2:order=1"));
     assert!(buy_ack.contains("accepted:3:order=2"));
     assert!(buy_ack.contains("executed:4:resting=1:aggressing=2"));
     assert!(feed_event_2.contains("executed:4:resting=1:aggressing=2"));
+    assert!(replay_event_1.contains("rested:2:order=1"));
+    assert!(replay_event_2.contains("executed:4:resting=1:aggressing=2"));
     assert!(revenue.contains("ok revenue asset=USD amount=10"));
 }
 
@@ -33,7 +36,10 @@ fn spawn_server(order_addr: &str, feed_addr: &str) -> Child {
         .expect("spawn exchange_ws")
 }
 
-fn run_cycle(order_addr: &str, feed_addr: &str) -> (String, String, String, String, String) {
+fn run_cycle(
+    order_addr: &str,
+    feed_addr: &str,
+) -> (String, String, String, String, String, String, String) {
     let mut feed = connect_with_retry(&format!("ws://{feed_addr}"));
     assert!(read_text(&mut feed).contains("exch-ws-feed"));
     feed.send(Message::Text("subscribe 0 10".to_string()))
@@ -64,12 +70,29 @@ fn run_cycle(order_addr: &str, feed_addr: &str) -> (String, String, String, Stri
     let buy_ack = read_text(&mut order);
     let feed_event_2 = read_text(&mut feed);
 
+    let mut replay = connect_with_retry(&format!("ws://{feed_addr}"));
+    assert!(read_text(&mut replay).contains("exch-ws-feed"));
+    replay
+        .send(Message::Text("replay 0 0".to_string()))
+        .expect("send replay");
+    assert!(read_text(&mut replay).contains("ok replay"));
+    let replay_event_1 = read_text(&mut replay);
+    let replay_event_2 = read_text(&mut replay);
+
     order
         .send(Message::Text("revenue USD".to_string()))
         .expect("send revenue");
     let revenue = read_text(&mut order);
 
-    (sell_ack, feed_event_1, buy_ack, feed_event_2, revenue)
+    (
+        sell_ack,
+        feed_event_1,
+        buy_ack,
+        feed_event_2,
+        replay_event_1,
+        replay_event_2,
+        revenue,
+    )
 }
 
 fn connect_with_retry(url: &str) -> WebSocket<MaybeTlsStream<std::net::TcpStream>> {

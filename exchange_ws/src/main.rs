@@ -33,6 +33,7 @@ fn main() -> std::io::Result<()> {
 struct ExchangeState {
     venue: Mutex<Venue>,
     api_keys: ApiKeys,
+    feed_log: Mutex<BTreeMap<u32, Vec<FeedLogEntry>>>,
     feed_subscribers: Mutex<Vec<FeedSubscriber>>,
 }
 
@@ -43,20 +44,31 @@ impl ExchangeState {
         Self {
             venue: Mutex::new(venue),
             api_keys: ApiKeys::load(),
+            feed_log: Mutex::new(BTreeMap::new()),
             feed_subscribers: Mutex::new(Vec::new()),
         }
     }
 
     fn publish(&self, instrument_id: u32, events: &[BookEvent]) {
-        let messages = events
+        let entries = events
             .iter()
             .filter(|event| is_public_event(event))
-            .map(|event| format!("event instrument={instrument_id} {}", event_line(event)))
+            .map(|event| FeedLogEntry {
+                seq: event_seq(event),
+                message: format!("event instrument={instrument_id} {}", event_line(event)),
+            })
             .collect::<Vec<_>>();
 
-        if messages.is_empty() {
+        if entries.is_empty() {
             return;
         }
+
+        self.feed_log
+            .lock()
+            .expect("feed log mutex poisoned")
+            .entry(instrument_id)
+            .or_default()
+            .extend(entries.clone());
 
         let mut subscribers = self
             .feed_subscribers
@@ -67,8 +79,8 @@ impl ExchangeState {
                 return true;
             }
 
-            messages.iter().all(
-                |message| match subscriber.sender.try_send(message.clone()) {
+            entries.iter().all(
+                |entry| match subscriber.sender.try_send(entry.message.clone()) {
                     Ok(()) => true,
                     Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
                 },
@@ -85,6 +97,27 @@ impl ExchangeState {
                 sender,
             });
     }
+
+    fn replay(&self, instrument_id: u32, after_seq: u64) -> Vec<String> {
+        self.feed_log
+            .lock()
+            .expect("feed log mutex poisoned")
+            .get(&instrument_id)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.seq > after_seq)
+                    .map(|entry| entry.message.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FeedLogEntry {
+    seq: u64,
+    message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -279,7 +312,7 @@ impl RateLimit {
 fn handle_feed_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandlerResult {
     let mut socket = accept(stream)?;
     socket.send(Message::Text(
-        "ok hello protocol=exch-ws-feed commands=subscribe,help".to_string(),
+        "ok hello protocol=exch-ws-feed commands=subscribe,replay,help".to_string(),
     ))?;
 
     loop {
@@ -295,8 +328,12 @@ fn handle_feed_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandlerR
         let parts = message.to_text()?.split_whitespace().collect::<Vec<_>>();
         match parts.as_slice() {
             ["help"] => socket.send(Message::Text(
-                "ok help subscribe <instrument_id> [depth]".to_string(),
+                "ok help replay <instrument_id> <after_seq> | subscribe <instrument_id> [depth]"
+                    .to_string(),
             ))?,
+            ["replay", instrument_id, after_seq] => {
+                replay_feed_ws(*instrument_id, *after_seq, &exchange, &mut socket)?;
+            }
             ["subscribe", instrument_id] => {
                 subscribe_feed_ws(*instrument_id, None, &exchange, socket)?;
                 return Ok(());
@@ -368,6 +405,33 @@ fn subscribe_feed_ws(
     exchange.subscribe(instrument_id, sender);
 
     for message in receiver {
+        socket.send(Message::Text(message))?;
+    }
+
+    Ok(())
+}
+
+fn replay_feed_ws(
+    instrument_id: &str,
+    after_seq: &str,
+    exchange: &Arc<ExchangeState>,
+    socket: &mut WebSocket<TcpStream>,
+) -> tungstenite::Result<()> {
+    let Some(instrument_id) = parse(instrument_id) else {
+        socket.send(Message::Text("error invalid-instrument-id".to_string()))?;
+        return Ok(());
+    };
+    let Some(after_seq) = parse(after_seq) else {
+        socket.send(Message::Text("error invalid-after-seq".to_string()))?;
+        return Ok(());
+    };
+
+    let messages = exchange.replay(instrument_id, after_seq);
+    socket.send(Message::Text(format!(
+        "ok replay instrument={instrument_id} after_seq={after_seq} count={}",
+        messages.len()
+    )))?;
+    for message in messages {
         socket.send(Message::Text(message))?;
     }
 
@@ -681,6 +745,16 @@ fn is_public_event(event: &BookEvent) -> bool {
         event,
         BookEvent::Accepted { .. } | BookEvent::Rejected { .. }
     )
+}
+
+fn event_seq(event: &BookEvent) -> u64 {
+    match event {
+        BookEvent::Accepted { seq, .. }
+        | BookEvent::Executed { seq, .. }
+        | BookEvent::Rested { seq, .. }
+        | BookEvent::Canceled { seq, .. }
+        | BookEvent::Rejected { seq, .. } => *seq,
+    }
 }
 
 fn private_event(event: &BookEvent) -> String {

@@ -28,10 +28,12 @@ Keep order entry TCP-based, but make WebSocket the main public-client protocol.
 Keep public internet market data WebSocket-style. Add UDP multicast only for the LAN lab.
 
 1. Add an append-only feed log.
-   Persist every public feed event with instrument id, partition id, sequence, and checksum.
+   Persist every public feed event with instrument id, partition id, sequence, and checksum. The
+   WebSocket gateway currently has an in-memory replay log; the next step is durable storage.
 
 2. Add replay.
-   A client that detects a sequence gap can request events after a known sequence.
+   A client that detects a sequence gap can request events after a known sequence. The WebSocket
+   gateway currently supports `replay <instrument_id> <after_seq>`.
 
 3. Add Kraken-style subscriptions.
    Allow clients to subscribe to selected instruments and depths.
