@@ -3,14 +3,24 @@ use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 fn main() {
     let config = SimConfig::from_env();
+    if let Some(addr) = &config.live_addr {
+        run_live_demo_server(addr).expect("run live demo server");
+        return;
+    }
+
     let result = match config.world {
         SimWorld::SingleBin => run_single_bin_sim(&config),
         SimWorld::GlobalLob => run_global_lob_sim(&config),
         SimWorld::ShockDemo => run_shock_demo(&config),
+        SimWorld::LiveDemo => run_live_demo_once(&config),
     };
     println!("{result}");
 }
@@ -22,6 +32,7 @@ struct SimConfig {
     traders: u64,
     feed_subscribers: u64,
     visualization: Option<String>,
+    live_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +40,7 @@ enum SimWorld {
     SingleBin,
     GlobalLob,
     ShockDemo,
+    LiveDemo,
 }
 
 impl SimConfig {
@@ -39,6 +51,7 @@ impl SimConfig {
             traders: 100,
             feed_subscribers: 1,
             visualization: None,
+            live_addr: None,
         };
 
         let mut args = env::args().skip(1);
@@ -53,9 +66,10 @@ impl SimConfig {
                 "--visualization" => {
                     config.visualization = Some(parse_string_arg(&mut args, "--visualization"))
                 }
+                "--live" => config.live_addr = Some(parse_string_arg(&mut args, "--live")),
                 "--help" => {
                     println!(
-                        "usage: cargo run -p exchange_sim -- --world single-bin --commands 100000 --traders 100 --feed-subscribers 1\nworlds: single-bin, global-lob, shock-demo"
+                        "usage: cargo run -p exchange_sim -- --world single-bin --commands 100000 --traders 100 --feed-subscribers 1\n       cargo run -p exchange_sim -- --world live-demo --live 127.0.0.1:8088\nworlds: single-bin, global-lob, shock-demo, live-demo"
                     );
                     std::process::exit(0);
                 }
@@ -853,6 +867,469 @@ fn scale_inverted(
     max_pixel - (scale(value, min_value, max_value, min_pixel, max_pixel) - min_pixel)
 }
 
+#[derive(Debug, Clone)]
+struct LiveState {
+    step: u64,
+    venues: Vec<LiveVenueState>,
+    tape: VecDeque<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveVenueState {
+    name: String,
+    tier: String,
+    symbols: Vec<String>,
+    books: Vec<LiveBookState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LiveBookState {
+    bids: Vec<(u64, u64)>,
+    asks: Vec<(u64, u64)>,
+}
+
+fn run_live_demo_once(config: &SimConfig) -> SimResult {
+    let mut venues = live_demo_world(config.traders);
+    let mut rng = DeterministicRng::new(0x1a11_ce55);
+    let mut private_events = 0;
+    let mut public_events = 0;
+    let mut matcher_elapsed = Duration::ZERO;
+    let mut feed = FeedSink::new(config.feed_subscribers);
+    let mut latencies = Vec::new();
+    let started = Instant::now();
+
+    for step in 0..config.commands {
+        let (venue_index, instrument_id) = live_target(&mut rng, &venues);
+        let venue = &mut venues[venue_index];
+        let order = live_demo_order(step, &mut rng, config.traders, venue.next_order_id);
+        venue.next_order_id += 1;
+
+        let matcher_started = Instant::now();
+        let events = venue
+            .venue
+            .submit_limit(instrument_id, order)
+            .expect("live-demo instrument should exist");
+        let matcher_done = Instant::now();
+        matcher_elapsed += matcher_done.duration_since(matcher_started);
+
+        private_events += events.len() as u64;
+        let emitted = feed.publish(&events);
+        let feed_done = Instant::now();
+        if emitted > 0 {
+            public_events += emitted;
+            latencies.push(feed_done.duration_since(matcher_done).as_nanos());
+        }
+    }
+
+    SimResult {
+        world: "live-demo",
+        venues: venues.len(),
+        instruments: venues
+            .iter()
+            .map(|venue| venue.instrument_count as usize)
+            .sum(),
+        commands: config.commands,
+        private_events,
+        public_events,
+        elapsed: started.elapsed(),
+        matcher_elapsed,
+        feed_latency: latency_stats(latencies),
+        visualization_path: None,
+    }
+}
+
+fn run_live_demo_server(addr: &str) -> std::io::Result<()> {
+    let venues = live_demo_world(64);
+    let state = Arc::new(Mutex::new(live_state_from_venues(
+        0,
+        &venues,
+        VecDeque::new(),
+    )));
+    let sim_state = Arc::clone(&state);
+    thread::spawn(move || run_live_sim_loop(venues, sim_state));
+
+    let listener = TcpListener::bind(addr)?;
+    println!("live demo listening on http://{addr}");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let state = Arc::clone(&state);
+                thread::spawn(move || {
+                    if let Err(error) = handle_live_http(stream, state) {
+                        eprintln!("live client error: {error}");
+                    }
+                });
+            }
+            Err(error) => eprintln!("live accept error: {error}"),
+        }
+    }
+    Ok(())
+}
+
+fn run_live_sim_loop(mut venues: Vec<VenueRuntime>, state: Arc<Mutex<LiveState>>) {
+    let mut rng = DeterministicRng::new(0xfeed_f00d);
+    let mut step = 0;
+    let mut tape = VecDeque::new();
+
+    loop {
+        for _ in 0..120 {
+            let (venue_index, instrument_id) = live_target(&mut rng, &venues);
+            let venue = &mut venues[venue_index];
+            let order = live_demo_order(step, &mut rng, 64, venue.next_order_id);
+            venue.next_order_id += 1;
+            let events = venue
+                .venue
+                .submit_limit(instrument_id, order)
+                .expect("live-demo instrument should exist");
+            for event in events.iter().filter(|event| is_public_event(event)) {
+                let symbol = &venue.symbols[instrument_id as usize];
+                tape.push_front(format!(
+                    "{} {symbol}/USD {}",
+                    venue.name,
+                    format_public_event(event)
+                ));
+            }
+            while tape.len() > 80 {
+                tape.pop_back();
+            }
+            step += 1;
+        }
+
+        let next_state = live_state_from_venues(step, &venues, tape.clone());
+        *state.lock().expect("live state mutex poisoned") = next_state;
+        thread::sleep(Duration::from_millis(60));
+    }
+}
+
+fn live_demo_world(traders: u64) -> Vec<VenueRuntime> {
+    let specs = [
+        (
+            "ny-core",
+            "equity-fast",
+            ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"],
+        ),
+        (
+            "ldn-ecn",
+            "fx-ecn",
+            ["EUR", "GBP", "CHF", "JPY", "AUD", "CAD"],
+        ),
+        (
+            "sg-crypto",
+            "crypto-major",
+            ["BTC", "ETH", "SOL", "XRP", "DOGE", "ARB"],
+        ),
+        (
+            "tail-venue",
+            "crypto-tail",
+            ["TAIL0", "TAIL1", "TAIL2", "TAIL3", "TAIL4", "TAIL5"],
+        ),
+    ];
+    let mut venues = Vec::new();
+    for (venue_index, (name, tier, symbols)) in specs.into_iter().enumerate() {
+        let symbol_strings = symbols
+            .iter()
+            .map(|symbol| symbol.to_string())
+            .collect::<Vec<_>>();
+        let mut venue = Venue::new(VenueConfig::star(
+            name.to_string(),
+            "USD",
+            symbol_strings.iter().cloned(),
+        ));
+        seed_world_accounts(
+            &mut venue,
+            symbol_strings.iter().map(String::as_str),
+            traders.max(64),
+        );
+        let mut next_order_id = 1;
+        for instrument_id in 0..symbol_strings.len() as u32 {
+            next_order_id = seed_live_book(&mut venue, instrument_id, next_order_id, venue_index);
+        }
+        venues.push(VenueRuntime {
+            name: name.to_string(),
+            tier: tier.to_string(),
+            symbols: symbol_strings,
+            venue,
+            instrument_count: symbols.len() as u32,
+            command_weight: match tier {
+                "equity-fast" => 5,
+                "fx-ecn" => 4,
+                "crypto-major" => 4,
+                _ => 2,
+            },
+            next_order_id,
+        });
+    }
+    venues
+}
+
+fn seed_live_book(
+    venue: &mut Venue,
+    instrument_id: u32,
+    mut order_id: u64,
+    venue_index: usize,
+) -> u64 {
+    let center = 10_000 + venue_index as u64 * 100;
+    for level in 0..8 {
+        let level = level as u64;
+        for slot in 0..3 {
+            let slot = slot as u64;
+            let quantity = 80 + level * 18 + slot * 7;
+            let bid = NewOrder {
+                order_id,
+                account_id: 2 + slot,
+                side: Side::Buy,
+                price: Price(center - 10 - level * 8),
+                quantity,
+            };
+            order_id += 1;
+            venue
+                .submit_limit(instrument_id, bid)
+                .expect("live seed bid should submit");
+
+            let ask = NewOrder {
+                order_id,
+                account_id: 12 + slot,
+                side: Side::Sell,
+                price: Price(center + 10 + level * 8),
+                quantity,
+            };
+            order_id += 1;
+            venue
+                .submit_limit(instrument_id, ask)
+                .expect("live seed ask should submit");
+        }
+    }
+    order_id
+}
+
+fn live_target(rng: &mut DeterministicRng, venues: &[VenueRuntime]) -> (usize, u32) {
+    let total_weight = venues.iter().map(|venue| venue.command_weight).sum::<u64>();
+    let venue_index = weighted_venue_index(rng, venues, total_weight);
+    let instrument_id = rng.next_u32(venues[venue_index].instrument_count);
+    (venue_index, instrument_id)
+}
+
+fn live_demo_order(step: u64, rng: &mut DeterministicRng, traders: u64, order_id: u64) -> NewOrder {
+    let side = if rng.next_u64(100) < 50 {
+        Side::Buy
+    } else {
+        Side::Sell
+    };
+    let marketable = rng.next_u64(100) < 72;
+    let price = match (side, marketable) {
+        (Side::Buy, true) => 10_500,
+        (Side::Sell, true) => 9_500,
+        (Side::Buy, false) => 9_970 + rng.next_u64(30),
+        (Side::Sell, false) => 10_030 + rng.next_u64(30),
+    };
+
+    NewOrder {
+        order_id,
+        account_id: (step % traders.max(64)) + 1,
+        side,
+        price: Price(price),
+        quantity: 6 + rng.next_u64(22),
+    }
+}
+
+fn live_state_from_venues(step: u64, venues: &[VenueRuntime], tape: VecDeque<String>) -> LiveState {
+    let venues = venues
+        .iter()
+        .map(|venue| {
+            let books = (0..venue.instrument_count)
+                .map(|instrument_id| {
+                    let snapshot = venue
+                        .venue
+                        .snapshot(instrument_id, 8)
+                        .expect("live snapshot should exist");
+                    LiveBookState {
+                        bids: snapshot
+                            .bids
+                            .iter()
+                            .map(|level| (level.price.0, level.quantity))
+                            .collect(),
+                        asks: snapshot
+                            .asks
+                            .iter()
+                            .map(|level| (level.price.0, level.quantity))
+                            .collect(),
+                    }
+                })
+                .collect();
+            LiveVenueState {
+                name: venue.name.clone(),
+                tier: venue.tier.clone(),
+                symbols: venue.symbols.clone(),
+                books,
+            }
+        })
+        .collect();
+    LiveState { step, venues, tape }
+}
+
+fn handle_live_http(mut stream: TcpStream, state: Arc<Mutex<LiveState>>) -> std::io::Result<()> {
+    let mut buffer = [0; 2048];
+    let bytes = stream.read(&mut buffer)?;
+    let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    match path {
+        "/" => write_http_response(&mut stream, "text/html; charset=utf-8", live_demo_html()),
+        "/state" => {
+            let state = state.lock().expect("live state mutex poisoned").clone();
+            write_http_response(
+                &mut stream,
+                "application/json; charset=utf-8",
+                live_state_json(&state),
+            )
+        }
+        _ => write_http_response(
+            &mut stream,
+            "text/plain; charset=utf-8",
+            "not found".to_string(),
+        ),
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    content_type: &str,
+    body: String,
+) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn live_state_json(state: &LiveState) -> String {
+    let mut json = String::new();
+    let _ = write!(json, "{{\"step\":{},\"venues\":[", state.step);
+    for (venue_index, venue) in state.venues.iter().enumerate() {
+        if venue_index > 0 {
+            json.push(',');
+        }
+        let _ = write!(
+            json,
+            "{{\"name\":\"{}\",\"tier\":\"{}\",\"symbols\":[",
+            json_escape(&venue.name),
+            json_escape(&venue.tier)
+        );
+        for (symbol_index, symbol) in venue.symbols.iter().enumerate() {
+            if symbol_index > 0 {
+                json.push(',');
+            }
+            let _ = write!(json, "\"{}\"", json_escape(symbol));
+        }
+        json.push_str("],\"books\":[");
+        for (book_index, book) in venue.books.iter().enumerate() {
+            if book_index > 0 {
+                json.push(',');
+            }
+            json.push_str("{\"bids\":[");
+            write_level_json(&mut json, &book.bids);
+            json.push_str("],\"asks\":[");
+            write_level_json(&mut json, &book.asks);
+            json.push_str("]}");
+        }
+        json.push_str("]}");
+    }
+    json.push_str("],\"tape\":[");
+    for (index, event) in state.tape.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        let _ = write!(json, "\"{}\"", json_escape(event));
+    }
+    json.push_str("]}");
+    json
+}
+
+fn live_demo_html() -> String {
+    let mut html = String::new();
+    let _ = writeln!(
+        html,
+        "<!doctype html><meta charset=\"utf-8\"><title>exch live demo</title><style>body{{margin:0;font-family:system-ui,sans-serif;background:#07111f;color:#ecf3ff}}#app{{display:grid;grid-template-columns:330px 1fr 360px;min-height:100vh}}aside,.tape{{padding:18px;background:#101b2c;overflow:auto}}main{{padding:18px}}button{{font:inherit;border:1px solid #34445d;background:#17243a;color:#ecf3ff;border-radius:6px;padding:8px 10px;cursor:pointer}}button.active{{background:#2f80ed;border-color:#2f80ed}}.venue-grid,.edge-grid{{display:grid;gap:8px}}.venue-grid{{grid-template-columns:1fr 1fr}}.edge-grid{{grid-template-columns:repeat(3,1fr);margin:14px 0}}.panel{{background:#0d1828;border:1px solid #26374f;border-radius:8px;padding:14px;margin-bottom:14px}}.book{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}table{{width:100%;border-collapse:collapse}}td,th{{padding:5px 8px;border-bottom:1px solid #203047;text-align:right}}td:first-child,th:first-child{{text-align:left}}.asks td{{color:#ff7b91}}.bids td{{color:#64d17a}}.bar{{display:inline-block;height:10px;background:#2f80ed;border-radius:2px}}.muted{{color:#93a4bd}}pre{{white-space:pre-wrap;font:12px ui-monospace,monospace;line-height:1.45}}</style>"
+    );
+    let _ = writeln!(html, "<div id=\"app\"><aside><h1>exch live</h1><p class=\"muted\">Four live venues, 24 books, synthetic high-activity order flow. Click a venue and edge.</p><div id=\"venues\" class=\"venue-grid\"></div><div class=\"panel\"><div id=\"stats\"></div></div></aside><main><section class=\"panel\"><h2 id=\"venue-title\">venue</h2><div id=\"edges\" class=\"edge-grid\"></div></section><section class=\"panel\"><h2 id=\"edge-title\">book</h2><div class=\"book\"><div><h3>Asks</h3><table class=\"asks\"><tbody id=\"asks\"></tbody></table></div><div><h3>Bids</h3><table class=\"bids\"><tbody id=\"bids\"></tbody></table></div></div></section></main><section class=\"tape\"><h2>Event Tape</h2><pre id=\"tape\"></pre></section></div>");
+    let _ = writeln!(html, "<script>{}</script>", live_demo_js());
+    html
+}
+
+fn live_demo_js() -> &'static str {
+    r#"
+let state = null;
+let venueIndex = 0;
+let edgeIndex = 0;
+
+async function tick() {
+  const response = await fetch('/state', {cache: 'no-store'});
+  state = await response.json();
+  render();
+}
+
+function render() {
+  if (!state) return;
+  renderVenues();
+  renderEdges();
+  renderBook();
+  document.getElementById('stats').innerHTML = `<b>step</b> ${state.step}<br><b>venues</b> ${state.venues.length}<br><b>books</b> ${state.venues.reduce((n,v)=>n+v.books.length,0)}`;
+  document.getElementById('tape').textContent = state.tape.join('\n');
+}
+
+function renderVenues() {
+  const el = document.getElementById('venues');
+  el.innerHTML = '';
+  state.venues.forEach((venue, index) => {
+    const b = document.createElement('button');
+    b.className = index === venueIndex ? 'active' : '';
+    b.innerHTML = `${venue.name}<br><span class="muted">${venue.tier}</span>`;
+    b.onclick = () => { venueIndex = index; edgeIndex = 0; render(); };
+    el.appendChild(b);
+  });
+}
+
+function renderEdges() {
+  const venue = state.venues[venueIndex];
+  document.getElementById('venue-title').textContent = `${venue.name} (${venue.tier})`;
+  const el = document.getElementById('edges');
+  el.innerHTML = '';
+  venue.symbols.forEach((symbol, index) => {
+    const b = document.createElement('button');
+    b.className = index === edgeIndex ? 'active' : '';
+    b.textContent = `${symbol}/USD`;
+    b.onclick = () => { edgeIndex = index; renderBook(); renderEdges(); };
+    el.appendChild(b);
+  });
+}
+
+function renderBook() {
+  const venue = state.venues[venueIndex];
+  const book = venue.books[edgeIndex];
+  const symbol = venue.symbols[edgeIndex];
+  document.getElementById('edge-title').textContent = `${venue.name} ${symbol}/USD`;
+  document.getElementById('asks').innerHTML = rows([...book.asks].reverse(), 'ask');
+  document.getElementById('bids').innerHTML = rows(book.bids, 'bid');
+}
+
+function rows(levels, side) {
+  const max = Math.max(1, ...levels.map(([, q]) => q));
+  return levels.map(([price, qty]) => {
+    const width = Math.max(4, Math.round(qty * 100 / max));
+    return `<tr><td>${qty}</td><td><span class="bar" style="width:${width}%"></span></td><td>${price}</td></tr>`;
+  }).join('');
+}
+
+tick();
+setInterval(tick, 250);
+"#
+}
+
 fn write_global_lob_visualization(
     path: &str,
     venues: &[VenueRuntime],
@@ -1180,6 +1657,7 @@ fn parse_world(args: &mut impl Iterator<Item = String>) -> SimWorld {
         Some("single-bin") => SimWorld::SingleBin,
         Some("global-lob") => SimWorld::GlobalLob,
         Some("shock-demo") => SimWorld::ShockDemo,
+        Some("live-demo") => SimWorld::LiveDemo,
         Some(world) => panic!("unknown world: {world}"),
         None => panic!("--world requires a value"),
     }
@@ -1264,6 +1742,7 @@ mod tests {
             traders: 20,
             feed_subscribers: 1,
             visualization: Some(path.to_string()),
+            live_addr: None,
         };
 
         let result = run_shock_demo(&config);
@@ -1285,6 +1764,7 @@ mod tests {
             traders: 20,
             feed_subscribers: 1,
             visualization: Some(path.to_string()),
+            live_addr: None,
         };
 
         let result = run_global_lob_sim(&config);
@@ -1296,5 +1776,19 @@ mod tests {
         assert!(html.contains("equity-global-00"));
         assert!(html.contains("\"playback\""));
         assert!(html.contains("function selectVenue"));
+    }
+
+    #[test]
+    fn live_demo_state_contains_active_books() {
+        let venues = live_demo_world(16);
+        let state = live_state_from_venues(42, &venues, VecDeque::from(["event".to_string()]));
+        let json = live_state_json(&state);
+
+        assert_eq!(state.venues.len(), 4);
+        assert_eq!(state.venues[0].books.len(), 6);
+        assert!(json.contains("\"step\":42"));
+        assert!(json.contains("ny-core"));
+        assert!(json.contains("\"bids\""));
+        assert!(live_demo_html().contains("exch live"));
     }
 }

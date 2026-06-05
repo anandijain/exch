@@ -72,6 +72,22 @@ Open `data/artifacts/visualizations/global-lob-viewer.html` in a browser. The vi
 venue nodes, lets you click into a venue's asset graph, then click an edge to inspect and play the
 recorded book states for that edge.
 
+That loaded-run viewer is generated after the simulation finishes. For a live local demo, run:
+
+```powershell
+cargo run -p exchange_sim -- --world live-demo --live 127.0.0.1:8088
+```
+
+Then open `http://127.0.0.1:8088`. The live runner serves a small browser UI and a `/state` JSON
+endpoint from the same Rust process that owns the live books. It uses four venues and 24 books with
+high-activity synthetic order flow so the event tape and book ladders move continuously.
+
+Current runtime boundary: `exchange_sim` live books are real `Venue`/`OrderBook` instances, but
+they are not yet the same books served by `exchange_ws`. External connector/order-entry scripts
+still connect to `exchange_ws`, which owns its own venue. The next integration step is to extract a
+shared world runtime so WebSocket order entry, market-data clients, and the simulator UI can all
+attach to the same venue set.
+
 ## Capacity Notes
 
 Book count is not the only memory driver. The current generated world stores venue configs, symbol
