@@ -67,7 +67,7 @@ full coverage.
 For a small visual scenario instead of a pure throughput run:
 
 ```powershell
-cargo run -p exchange_sim -- --world shock-demo --commands 160 --traders 40 --feed-subscribers 1 --visualization /tmp/exch-shock-demo.html
+cargo run -p exchange_sim -- --world shock-demo --commands 160 --traders 40 --feed-subscribers 1 --visualization data/artifacts/visualizations/shock-demo.html
 ```
 
 `shock-demo` seeds one book with bid/ask depth, runs background order flow, injects one large buy
