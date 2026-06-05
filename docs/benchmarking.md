@@ -62,6 +62,19 @@ trader subscribes to every generated venue/instrument edge and receives public e
 the source edge. Later worlds should make this information profile configurable instead of assuming
 full coverage.
 
+## Shock Demo
+
+For a small visual scenario instead of a pure throughput run:
+
+```powershell
+cargo run -p exchange_sim -- --world shock-demo --commands 160 --traders 40 --feed-subscribers 1 --visualization /tmp/exch-shock-demo.html
+```
+
+`shock-demo` seeds one book with bid/ask depth, runs background order flow, injects one large buy
+shock halfway through the run, and then lets ask-side replenishment orders arrive. The optional
+`--visualization` path writes a standalone HTML/SVG chart with midprice, spread, and top-five
+bid/ask depth over the run.
+
 On one local release-mode run after adding balance reservations and fee accounting, with 100,000
 commands, 1,000 traders, and 1 feed subscriber, the simulator reported about 809k commands/sec
 overall, 1.09M matcher/risk commands/sec, and 200 ns p50 in-process feed publication latency.
