@@ -6,6 +6,8 @@ some market-data flavor from Kraken and Nasdaq.
 ## Shape
 
 - `exchange_core`: deterministic matching engine and book event model.
+- `exchange_research`: small CLI for collecting real-world venue/market-structure reference data
+  to seed simulation universes.
 - `exchange_server`: dependency-free local TCP gateway for early experiments.
 - Future `exchange_api`: public HTTP/WebSocket API for placing orders and reading the book.
 - Future `exchange_gateway`: local-network UDP multicast publisher for exchange-style feeds.
@@ -44,6 +46,13 @@ cargo run --release -p exchange_sim -- --commands 1000000 --traders 1000 --feed-
 
 See `docs/benchmarking.md` for what it measures.
 See `docs/risk_and_fees.md` for maker/taker fees, reservations, and rate limits.
+
+Inspect the current research source list and generated-world assumptions:
+
+```powershell
+cargo run -p exchange_research -- sources
+cargo run -p exchange_research -- profile global-lob
+```
 
 Run the first local WebSocket gateway:
 

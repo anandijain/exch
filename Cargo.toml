@@ -1,5 +1,11 @@
 [workspace]
-members = ["exchange_core", "exchange_server", "exchange_sim", "exchange_ws"]
+members = [
+    "exchange_core",
+    "exchange_research",
+    "exchange_server",
+    "exchange_sim",
+    "exchange_ws",
+]
 resolver = "2"
 
 [workspace.package]

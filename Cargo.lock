@@ -69,6 +69,10 @@ name = "exchange_core"
 version = "0.1.0"
 
 [[package]]
+name = "exchange_research"
+version = "0.1.0"
+
+[[package]]
 name = "exchange_server"
 version = "0.1.0"
 dependencies = [

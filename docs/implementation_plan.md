@@ -64,6 +64,15 @@ This is simpler, faster, and closer to how a scalable exchange should feel.
 
 ## Interesting Experiments
 
+- Simulated economy universes.
+  Treat a runnable experiment as a universe made of one or more venues, instruments, trader
+  populations, exchange delays, feed delays, fee schedules, and scheduled shocks. Useful universes
+  include a control world with no background fake trades, sparse versus dense currency graphs,
+  many small exchanges with only a few symbols each, and worlds where trader populations are
+  restricted to specific algorithms. The goal is to compare how market structure and agent behavior
+  change price formation, liquidity, arbitrage, stale-information opportunities, and resilience
+  under perturbation.
+
 - Intentionally unbalanced symbol bins.
   Put one group of instruments on a hot/slow partition and another group on a quiet/fast partition.
   Then run cross-symbol or currency-cycle strategies to see whether delayed feed publication creates
