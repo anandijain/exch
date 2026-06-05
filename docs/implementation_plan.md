@@ -79,3 +79,12 @@ This is simpler, faster, and closer to how a scalable exchange should feel.
   assets/currencies, physical delivery can be easier than cash settlement because the exchange can
   reserve deliverable assets up front and transfer them at expiry without needing an external
   settlement-price oracle.
+
+- Malicious venue experiments.
+  Model the venue itself as the bad actor and ask what evidence traders need to prove malfeasance.
+  Interesting cases include violating price-time priority within a price level, selectively delaying
+  or suppressing public feed events, giving favored accounts earlier private reports, issuing
+  inconsistent private and public executions, changing sequence numbers, selectively rejecting valid
+  orders, or publishing snapshots/checksums that do not match the event log. The goal is to learn
+  which trust problems can be detected from public feed logs, private order reports, checksums, and
+  formal matcher invariants.
