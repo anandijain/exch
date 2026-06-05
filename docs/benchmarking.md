@@ -62,6 +62,33 @@ trader subscribes to every generated venue/instrument edge and receives public e
 the source edge. Later worlds should make this information profile configurable instead of assuming
 full coverage.
 
+Generate a clickable standalone viewer for a loaded run:
+
+```powershell
+cargo run -p exchange_sim -- --world global-lob --commands 1000 --traders 40 --feed-subscribers 1 --visualization data/artifacts/visualizations/global-lob-viewer.html
+```
+
+Open `data/artifacts/visualizations/global-lob-viewer.html` in a browser. The viewer starts with
+venue nodes, lets you click into a venue's asset graph, then click an edge to inspect and play the
+recorded book states for that edge.
+
+## Capacity Notes
+
+Book count is not the only memory driver. The current generated world stores venue configs, symbol
+strings, accounts/balances, market-data views, and active resting orders in addition to empty or
+active order books.
+
+One local release-mode run:
+
+```powershell
+/usr/bin/time -v target/release/exchange_sim --world global-lob --commands 10000 --traders 100 --feed-subscribers 0
+```
+
+reported `venues=96`, `instruments=10200`, about 158k commands/sec, and maximum resident set size
+of 157,108 KB. Treat this as a rough first read: it says 10k books are comfortable locally, but it
+does not yet tell us the hard ceiling. A dedicated capacity command should sweep venue/book/account
+counts and report memory per book and per seeded account.
+
 ## Shock Demo
 
 For a small visual scenario instead of a pure throughput run:

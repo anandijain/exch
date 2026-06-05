@@ -1,5 +1,5 @@
 use exchange_core::{BookEvent, NewOrder, Price, Side, Venue, VenueConfig};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
@@ -205,6 +205,9 @@ fn run_single_bin_sim(config: &SimConfig) -> SimResult {
 
 #[derive(Debug)]
 struct VenueRuntime {
+    name: String,
+    tier: String,
+    symbols: Vec<String>,
     venue: Venue,
     instrument_count: u32,
     command_weight: u64,
@@ -225,6 +228,7 @@ fn run_global_lob_sim(config: &SimConfig) -> SimResult {
     let mut private_events = 0;
     let mut public_events = 0;
     let mut matcher_elapsed = Duration::ZERO;
+    let mut playback = GlobalPlayback::new();
 
     let started = Instant::now();
 
@@ -255,7 +259,16 @@ fn run_global_lob_sim(config: &SimConfig) -> SimResult {
             public_events += emitted;
             latencies.push(feed_done.duration_since(matcher_done).as_nanos());
         }
+        if config.visualization.is_some() {
+            playback.record(index, edge, &venues[venue_index].venue, &events);
+        }
     }
+
+    let visualization_path = config.visualization.as_ref().map(|path| {
+        write_global_lob_visualization(path, &venues, &playback)
+            .expect("write global-lob visualization");
+        path.clone()
+    });
 
     SimResult {
         world: "global-lob",
@@ -267,7 +280,7 @@ fn run_global_lob_sim(config: &SimConfig) -> SimResult {
         elapsed: started.elapsed(),
         matcher_elapsed,
         feed_latency: latency_stats(latencies),
-        visualization_path: None,
+        visualization_path,
     }
 }
 
@@ -303,6 +316,9 @@ fn add_venue_tier(
         ));
         seed_world_accounts(&mut venue, symbols.iter().map(String::as_str), traders);
         venues.push(VenueRuntime {
+            name,
+            tier: tier.to_string(),
+            symbols,
             venue,
             instrument_count: symbols_per_venue as u32,
             command_weight,
@@ -377,6 +393,60 @@ struct EdgeId {
 struct ObservedBookEvent {
     edge: EdgeId,
     message: String,
+}
+
+#[derive(Debug, Clone)]
+struct BookFrame {
+    step: u64,
+    bids: Vec<(u64, u64)>,
+    asks: Vec<(u64, u64)>,
+    events: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct GlobalPlayback {
+    frames_by_edge: BTreeMap<EdgeId, Vec<BookFrame>>,
+}
+
+impl GlobalPlayback {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn record(&mut self, step: u64, edge: EdgeId, venue: &Venue, events: &[BookEvent]) {
+        let public_events = events
+            .iter()
+            .filter(|event| is_public_event(event))
+            .map(format_public_event)
+            .collect::<Vec<_>>();
+        if public_events.is_empty() {
+            return;
+        }
+
+        let snapshot = venue
+            .snapshot(edge.instrument_id, 8)
+            .expect("global-lob snapshot should exist");
+        let bids = snapshot
+            .bids
+            .iter()
+            .map(|level| (level.price.0, level.quantity))
+            .collect();
+        let asks = snapshot
+            .asks
+            .iter()
+            .map(|level| (level.price.0, level.quantity))
+            .collect();
+
+        self.frames_by_edge
+            .entry(edge)
+            .or_default()
+            .push(BookFrame {
+                step,
+                bids,
+                asks,
+                events: public_events,
+            });
+    }
 }
 
 #[derive(Debug, Default)]
@@ -783,6 +853,217 @@ fn scale_inverted(
     max_pixel - (scale(value, min_value, max_value, min_pixel, max_pixel) - min_pixel)
 }
 
+fn write_global_lob_visualization(
+    path: &str,
+    venues: &[VenueRuntime],
+    playback: &GlobalPlayback,
+) -> std::io::Result<()> {
+    let html = global_lob_visualization_html(venues, playback);
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(path, html)
+}
+
+fn global_lob_visualization_html(venues: &[VenueRuntime], playback: &GlobalPlayback) -> String {
+    let mut html = String::new();
+    let _ = writeln!(
+        html,
+        "<!doctype html><meta charset=\"utf-8\"><title>global-lob viewer</title>"
+    );
+    let _ = writeln!(
+        html,
+        "<style>body{{margin:0;font-family:system-ui,sans-serif;background:#f5f7fa;color:#17202a}}#app{{display:grid;grid-template-columns:360px 1fr;min-height:100vh}}aside{{background:#18202a;color:white;padding:18px;overflow:auto}}main{{padding:18px;display:grid;grid-template-rows:auto 1fr;gap:14px}}button{{font:inherit;border:1px solid #c8ced8;background:white;border-radius:6px;padding:7px 9px;cursor:pointer}}button.active{{background:#1d6fbe;color:white;border-color:#1d6fbe}}.venue-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}}.venue{{height:46px}}.panel{{background:white;border:1px solid #d8dde6;border-radius:8px;padding:14px}}.edge-list{{display:flex;flex-wrap:wrap;gap:6px;max-height:180px;overflow:auto}}.book{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}table{{width:100%;border-collapse:collapse}}td,th{{padding:4px 6px;border-bottom:1px solid #edf0f4;text-align:right}}th:first-child,td:first-child{{text-align:left}}.asks td{{color:#a40e26}}.bids td{{color:#22863a}}.tape{{max-height:160px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px;background:#101820;color:#d6f0ff;padding:10px;border-radius:6px}}.muted{{color:#667085}}.row{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}</style>"
+    );
+    let _ = writeln!(html, "<div id=\"app\"><aside><h1>global-lob</h1><p>Click a venue, then an edge. Press play to step through recorded public events for that book.</p><div id=\"venues\" class=\"venue-grid\"></div></aside><main><section class=\"panel\"><h2 id=\"venue-title\">Choose a venue</h2><p id=\"venue-meta\" class=\"muted\"></p><div id=\"edges\" class=\"edge-list\"></div></section><section class=\"panel\"><div class=\"row\"><h2 id=\"edge-title\">No edge selected</h2><button id=\"prev\">Prev</button><button id=\"play\">Play</button><button id=\"next\">Next</button><span id=\"frame-label\" class=\"muted\"></span></div><div class=\"book\"><div><h3>Asks</h3><table class=\"asks\"><tbody id=\"asks\"></tbody></table></div><div><h3>Bids</h3><table class=\"bids\"><tbody id=\"bids\"></tbody></table></div></div><h3>Event tape</h3><div id=\"tape\" class=\"tape\"></div></section></main></div>");
+    let _ = writeln!(
+        html,
+        "<script>const DATA={};\n{}</script>",
+        global_lob_json(venues, playback),
+        global_lob_viewer_js()
+    );
+    html
+}
+
+fn global_lob_json(venues: &[VenueRuntime], playback: &GlobalPlayback) -> String {
+    let mut json = String::new();
+    let _ = write!(json, "{{\"venues\":[");
+    for (venue_index, venue) in venues.iter().enumerate() {
+        if venue_index > 0 {
+            json.push(',');
+        }
+        let _ = write!(
+            json,
+            "{{\"name\":\"{}\",\"tier\":\"{}\",\"symbols\":[",
+            json_escape(&venue.name),
+            json_escape(&venue.tier)
+        );
+        for (symbol_index, symbol) in venue.symbols.iter().enumerate() {
+            if symbol_index > 0 {
+                json.push(',');
+            }
+            let _ = write!(json, "\"{}\"", json_escape(symbol));
+        }
+        json.push_str("]}");
+    }
+    json.push_str("],\"playback\":{");
+    for (index, (edge, frames)) in playback.frames_by_edge.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        let _ = write!(json, "\"{}:{}\":[", edge.venue_index, edge.instrument_id);
+        for (frame_index, frame) in frames.iter().enumerate() {
+            if frame_index > 0 {
+                json.push(',');
+            }
+            let _ = write!(json, "{{\"step\":{},\"bids\":[", frame.step);
+            write_level_json(&mut json, &frame.bids);
+            json.push_str("],\"asks\":[");
+            write_level_json(&mut json, &frame.asks);
+            json.push_str("],\"events\":[");
+            for (event_index, event) in frame.events.iter().enumerate() {
+                if event_index > 0 {
+                    json.push(',');
+                }
+                let _ = write!(json, "\"{}\"", json_escape(event));
+            }
+            json.push_str("]}");
+        }
+        json.push(']');
+    }
+    json.push_str("}}");
+    json
+}
+
+fn write_level_json(json: &mut String, levels: &[(u64, u64)]) {
+    for (index, (price, quantity)) in levels.iter().enumerate() {
+        if index > 0 {
+            json.push(',');
+        }
+        let _ = write!(json, "[{price},{quantity}]");
+    }
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+fn global_lob_viewer_js() -> &'static str {
+    r#"
+let venueIndex = 0;
+let edgeKey = null;
+let frameIndex = 0;
+let timer = null;
+
+const venuesEl = document.getElementById('venues');
+const edgesEl = document.getElementById('edges');
+const venueTitle = document.getElementById('venue-title');
+const venueMeta = document.getElementById('venue-meta');
+const edgeTitle = document.getElementById('edge-title');
+const frameLabel = document.getElementById('frame-label');
+const bidsEl = document.getElementById('bids');
+const asksEl = document.getElementById('asks');
+const tapeEl = document.getElementById('tape');
+const playEl = document.getElementById('play');
+
+function renderVenues() {
+  venuesEl.innerHTML = '';
+  DATA.venues.forEach((venue, index) => {
+    const button = document.createElement('button');
+    button.className = 'venue' + (index === venueIndex ? ' active' : '');
+    button.textContent = index + 1;
+    button.title = `${venue.name} (${venue.tier})`;
+    button.onclick = () => selectVenue(index);
+    venuesEl.appendChild(button);
+  });
+}
+
+function selectVenue(index) {
+  venueIndex = index;
+  const venue = DATA.venues[index];
+  venueTitle.textContent = venue.name;
+  venueMeta.textContent = `${venue.tier}, ${venue.symbols.length} edges`;
+  edgesEl.innerHTML = '';
+  venue.symbols.forEach((symbol, instrumentId) => {
+    const key = `${index}:${instrumentId}`;
+    const button = document.createElement('button');
+    button.textContent = symbol + '/USD';
+    button.className = key === edgeKey ? 'active' : '';
+    button.title = DATA.playback[key] ? `${DATA.playback[key].length} recorded frames` : 'No recorded events in this run';
+    button.onclick = () => selectEdge(key, symbol);
+    edgesEl.appendChild(button);
+  });
+  renderVenues();
+}
+
+function selectEdge(key, symbol) {
+  stop();
+  edgeKey = key;
+  frameIndex = 0;
+  edgeTitle.textContent = `${DATA.venues[venueIndex].name} ${symbol}/USD`;
+  selectVenue(venueIndex);
+  renderFrame();
+}
+
+function frames() {
+  return edgeKey ? (DATA.playback[edgeKey] || []) : [];
+}
+
+function renderFrame() {
+  const current = frames();
+  if (!current.length) {
+    bidsEl.innerHTML = '';
+    asksEl.innerHTML = '';
+    tapeEl.textContent = 'No public events were recorded for this edge in the loaded run.';
+    frameLabel.textContent = '';
+    return;
+  }
+  const frame = current[frameIndex];
+  bidsEl.innerHTML = rows(frame.bids);
+  asksEl.innerHTML = rows(frame.asks);
+  tapeEl.textContent = frame.events.join('\n');
+  frameLabel.textContent = `frame ${frameIndex + 1}/${current.length}, step ${frame.step}`;
+}
+
+function rows(levels) {
+  return levels.map(([price, qty]) => `<tr><td>${qty}</td><td>${price}</td></tr>`).join('');
+}
+
+function step(delta) {
+  const current = frames();
+  if (!current.length) return;
+  frameIndex = (frameIndex + delta + current.length) % current.length;
+  renderFrame();
+}
+
+function stop() {
+  if (timer) clearInterval(timer);
+  timer = null;
+  playEl.textContent = 'Play';
+}
+
+function togglePlay() {
+  if (timer) {
+    stop();
+  } else {
+    timer = setInterval(() => step(1), 350);
+    playEl.textContent = 'Pause';
+  }
+}
+
+document.getElementById('prev').onclick = () => step(-1);
+document.getElementById('next').onclick = () => step(1);
+playEl.onclick = togglePlay;
+renderVenues();
+selectVenue(0);
+"#
+}
+
 fn seed_sim_accounts(venue: &mut Venue, traders: u64) {
     for account_id in 1..=traders.max(1) {
         venue.credit(account_id, "USD", 1_000_000_000_000);
@@ -993,5 +1274,27 @@ mod tests {
         assert!(html.contains("<svg"));
         assert!(html.contains("shock-demo"));
         assert!(html.contains("large buy shock"));
+    }
+
+    #[test]
+    fn global_lob_writes_clickable_viewer() {
+        let path = "/tmp/exch-global-lob-viewer-test.html";
+        let config = SimConfig {
+            world: SimWorld::GlobalLob,
+            commands: 120,
+            traders: 20,
+            feed_subscribers: 1,
+            visualization: Some(path.to_string()),
+        };
+
+        let result = run_global_lob_sim(&config);
+        assert_eq!(result.world, "global-lob");
+        assert_eq!(result.visualization_path.as_deref(), Some(path));
+
+        let html = fs::read_to_string(path).expect("global-lob viewer should be readable");
+        assert!(html.contains("global-lob viewer"));
+        assert!(html.contains("equity-global-00"));
+        assert!(html.contains("\"playback\""));
+        assert!(html.contains("function selectVenue"));
     }
 }
