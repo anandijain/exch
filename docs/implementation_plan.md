@@ -28,8 +28,9 @@ Keep order entry TCP-based, but make WebSocket the main public-client protocol.
 Keep public internet market data WebSocket-style. Add UDP multicast only for the LAN lab.
 
 1. Add an append-only feed log.
-   Persist every public feed event with instrument id, partition id, sequence, and checksum. The
-   WebSocket gateway currently has an in-memory replay log; the next step is durable storage.
+   Persist every public feed event with instrument id, partition id, sequence, and checksum.
+   `exchange_runtime` now supports an optional durable line log through `EXCH_FEED_LOG_PATH`; the
+   next step is to enrich entries with partition ids, timestamps, and snapshot/checksum records.
 
 2. Add replay.
    A client that detects a sequence gap can request events after a known sequence. The WebSocket
@@ -53,6 +54,13 @@ Use one serial matching lane per partition. A partition owns one or more instrum
 partition, sequence is total. Across partitions, sequence is not globally ordered.
 
 This is simpler, faster, and closer to how a scalable exchange should feel.
+
+## Current Priority
+
+Prefer local simulation infrastructure over public cloud deployment for now. Public access remains
+future work, but the immediate goal is a robust local lab: shared venue runtime, durable/replayable
+market-data logs, configurable simulation worlds, and real client connections that can observe and
+trade against the same books the simulator owns.
 
 ## Next Proof Work
 

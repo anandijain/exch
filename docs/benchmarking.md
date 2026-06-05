@@ -82,11 +82,10 @@ Then open `http://127.0.0.1:8088`. The live runner serves a small browser UI and
 endpoint from the same Rust process that owns the live books. It uses four venues and 24 books with
 high-activity synthetic order flow so the event tape and book ladders move continuously.
 
-Current runtime boundary: `exchange_sim` live books are real `Venue`/`OrderBook` instances, but
-they are not yet the same books served by `exchange_ws`. External connector/order-entry scripts
-still connect to `exchange_ws`, which owns its own venue. The next integration step is to extract a
-shared world runtime so WebSocket order entry, market-data clients, and the simulator UI can all
-attach to the same venue set.
+Current runtime boundary: `exchange_runtime` now holds the reusable venue/feed-log layer used by
+`exchange_ws`, and `exchange_sim` shares the same public event formatting. The simulator still owns
+its own generated venue worlds. The next integration step is to make the simulator create a shared
+runtime that WebSocket order entry, market-data clients, and the simulator UI can all attach to.
 
 ## Capacity Notes
 

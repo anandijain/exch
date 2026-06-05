@@ -2,6 +2,7 @@
 members = [
     "exchange_core",
     "exchange_research",
+    "exchange_runtime",
     "exchange_server",
     "exchange_sim",
     "exchange_ws",

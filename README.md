@@ -8,6 +8,7 @@ some market-data flavor from Kraken and Nasdaq.
 - `exchange_core`: deterministic matching engine and book event model.
 - `exchange_research`: small CLI for collecting real-world venue/market-structure reference data
   to seed simulation universes.
+- `exchange_runtime`: shared venue runtime plus public feed formatting and replay logs.
 - `exchange_server`: dependency-free local TCP gateway for early experiments.
 - Future `exchange_api`: public HTTP/WebSocket API for placing orders and reading the book.
 - Future `exchange_gateway`: local-network UDP multicast publisher for exchange-style feeds.
@@ -77,6 +78,20 @@ Prices and quantities are integer ticks/lots. Asset-specific decimal display is 
 concern; matching should avoid floating point.
 
 ## Deployment Tracks
+
+### Local Simulation Lab
+
+The current priority is a local lab that can run many simulated venues, traders, shocks, and feed
+conditions while preserving an exchange-style event log. Public deployment is still interesting,
+but it should not drive the architecture before the local runtime, replay log, and simulator
+experiments are solid.
+
+Good near-term local goals:
+
+- one shared runtime that WebSocket clients and simulator tools can attach to;
+- durable public feed logs for replay and audit;
+- configurable venue/instrument/trader worlds;
+- repeatable scenarios for latency, partitioning, and malicious-venue experiments.
 
 ### Public API
 

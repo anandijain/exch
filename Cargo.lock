@@ -73,6 +73,13 @@ name = "exchange_research"
 version = "0.1.0"
 
 [[package]]
+name = "exchange_runtime"
+version = "0.1.0"
+dependencies = [
+ "exchange_core",
+]
+
+[[package]]
 name = "exchange_server"
 version = "0.1.0"
 dependencies = [
@@ -84,6 +91,7 @@ name = "exchange_sim"
 version = "0.1.0"
 dependencies = [
  "exchange_core",
+ "exchange_runtime",
 ]
 
 [[package]]
@@ -91,6 +99,7 @@ name = "exchange_ws"
 version = "0.1.0"
 dependencies = [
  "exchange_core",
+ "exchange_runtime",
  "tungstenite",
 ]
 

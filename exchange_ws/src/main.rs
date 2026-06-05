@@ -1,4 +1,7 @@
-use exchange_core::{BookEvent, Level, NewOrder, Price, Side, Venue, VenueConfig};
+use exchange_core::{NewOrder, Price, Side, Venue, VenueConfig};
+use exchange_runtime::{
+    levels, private_event, ExchangeRuntime, PublicFeedEntry, PublicFeedLog, RuntimeCommandResult,
+};
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
@@ -18,7 +21,7 @@ fn main() -> std::io::Result<()> {
     let order_addr =
         env::var("EXCH_WS_ORDER_ADDR").unwrap_or_else(|_| "127.0.0.1:7011".to_string());
     let feed_addr = env::var("EXCH_WS_FEED_ADDR").unwrap_or_else(|_| "127.0.0.1:7012".to_string());
-    let exchange = Arc::new(ExchangeState::new(default_config()));
+    let exchange = Arc::new(ExchangeState::new(default_config())?);
 
     let feed_exchange = Arc::clone(&exchange);
     let feed_thread = thread::spawn(move || listen_feed_ws(&feed_addr, feed_exchange));
@@ -31,60 +34,41 @@ fn main() -> std::io::Result<()> {
 }
 
 struct ExchangeState {
-    venue: Mutex<Venue>,
+    runtime: ExchangeRuntime,
     api_keys: ApiKeys,
-    feed_log: Mutex<BTreeMap<u32, Vec<FeedLogEntry>>>,
     feed_subscribers: Mutex<Vec<FeedSubscriber>>,
 }
 
 impl ExchangeState {
-    fn new(config: VenueConfig) -> Self {
+    fn new(config: VenueConfig) -> std::io::Result<Self> {
         let mut venue = Venue::new(config);
         seed_demo_accounts(&mut venue);
-        Self {
-            venue: Mutex::new(venue),
+        Ok(Self {
+            runtime: ExchangeRuntime::new(venue, PublicFeedLog::from_env()?),
             api_keys: ApiKeys::load(),
-            feed_log: Mutex::new(BTreeMap::new()),
             feed_subscribers: Mutex::new(Vec::new()),
-        }
+        })
     }
 
-    fn publish(&self, instrument_id: u32, events: &[BookEvent]) {
-        let entries = events
-            .iter()
-            .filter(|event| is_public_event(event))
-            .map(|event| FeedLogEntry {
-                seq: event_seq(event),
-                message: format!("event instrument={instrument_id} {}", event_line(event)),
-            })
-            .collect::<Vec<_>>();
-
+    fn publish(&self, entries: &[PublicFeedEntry]) {
         if entries.is_empty() {
             return;
         }
-
-        self.feed_log
-            .lock()
-            .expect("feed log mutex poisoned")
-            .entry(instrument_id)
-            .or_default()
-            .extend(entries.clone());
 
         let mut subscribers = self
             .feed_subscribers
             .lock()
             .expect("feed subscriber mutex poisoned");
         subscribers.retain(|subscriber| {
-            if subscriber.instrument_id != instrument_id {
-                return true;
-            }
-
-            entries.iter().all(
-                |entry| match subscriber.sender.try_send(entry.message.clone()) {
+            entries.iter().all(|entry| {
+                if subscriber.instrument_id != entry.instrument_id {
+                    return true;
+                }
+                match subscriber.sender.try_send(entry.message.clone()) {
                     Ok(()) => true,
                     Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
-                },
-            )
+                }
+            })
         });
     }
 
@@ -99,25 +83,12 @@ impl ExchangeState {
     }
 
     fn replay(&self, instrument_id: u32, after_seq: u64) -> Vec<String> {
-        self.feed_log
-            .lock()
-            .expect("feed log mutex poisoned")
-            .get(&instrument_id)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| entry.seq > after_seq)
-                    .map(|entry| entry.message.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.runtime
+            .replay(instrument_id, after_seq)
+            .into_iter()
+            .map(|entry| entry.message)
+            .collect()
     }
-}
-
-#[derive(Debug, Clone)]
-struct FeedLogEntry {
-    seq: u64,
-    message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -256,9 +227,7 @@ fn handle_order_ws(stream: TcpStream, exchange: Arc<ExchangeState>) -> WsHandler
             CommandResult::private("error rate-limit-exceeded")
         };
         socket.send(Message::Text(result.private_response))?;
-        if let Some((instrument_id, events)) = result.public_events {
-            exchange.publish(instrument_id, &events);
-        }
+        exchange.publish(&result.public_entries);
     }
 }
 
@@ -367,22 +336,10 @@ fn subscribe_feed_ws(
             };
             depth
         }
-        None => {
-            exchange
-                .venue
-                .lock()
-                .expect("venue mutex poisoned")
-                .config()
-                .default_snapshot_depth
-        }
+        None => exchange.runtime.config().default_snapshot_depth,
     };
 
-    let snapshot = match exchange
-        .venue
-        .lock()
-        .expect("venue mutex poisoned")
-        .snapshot(instrument_id, depth)
-    {
+    let snapshot = match exchange.runtime.snapshot(instrument_id, depth) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             socket.send(Message::Text("error unknown-instrument".to_string()))?;
@@ -440,25 +397,21 @@ fn replay_feed_ws(
 
 struct CommandResult {
     private_response: String,
-    public_events: Option<(u32, Vec<BookEvent>)>,
+    public_entries: Vec<PublicFeedEntry>,
 }
 
 impl CommandResult {
     fn private(response: impl Into<String>) -> Self {
         Self {
             private_response: response.into(),
-            public_events: None,
+            public_entries: Vec::new(),
         }
     }
 
-    fn with_public(
-        response: impl Into<String>,
-        instrument_id: u32,
-        events: Vec<BookEvent>,
-    ) -> Self {
+    fn with_public(response: impl Into<String>, result: RuntimeCommandResult) -> Self {
         Self {
             private_response: response.into(),
-            public_events: Some((instrument_id, events)),
+            public_entries: result.feed_entries,
         }
     }
 }
@@ -509,16 +462,15 @@ fn auth(
 }
 
 fn instruments(exchange: &Arc<ExchangeState>) -> String {
-    let venue = exchange.venue.lock().expect("venue mutex poisoned");
-    let instruments = venue
-        .config()
+    let config = exchange.runtime.config();
+    let instruments = config
         .instruments
         .iter()
         .map(|instrument| format!("{}:{}", instrument.id, instrument.symbol()))
         .collect::<Vec<_>>()
         .join(",");
 
-    format!("ok instruments venue={} {instruments}", venue.config().name)
+    format!("ok instruments venue={} {instruments}", config.name)
 }
 
 fn book(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
@@ -535,20 +487,10 @@ fn book(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
         };
         depth
     } else {
-        exchange
-            .venue
-            .lock()
-            .expect("venue mutex poisoned")
-            .config()
-            .default_snapshot_depth
+        exchange.runtime.config().default_snapshot_depth
     };
 
-    match exchange
-        .venue
-        .lock()
-        .expect("venue mutex poisoned")
-        .snapshot(instrument_id, depth)
-    {
+    match exchange.runtime.snapshot(instrument_id, depth) {
         Ok(snapshot) => format!(
             "ok book seq={} checksum={} bids={} asks={}",
             snapshot.seq,
@@ -594,22 +536,18 @@ fn order(parts: &[&str], exchange: &Arc<ExchangeState>, session: &OrderSession) 
         quantity,
     };
 
-    match exchange
-        .venue
-        .lock()
-        .expect("venue mutex poisoned")
-        .submit_limit(instrument_id, order)
-    {
-        Ok(events) => {
+    match exchange.runtime.submit_limit(instrument_id, order) {
+        Ok(result) => {
             let response = format!(
                 "ok events {}",
-                events
+                result
+                    .book_events
                     .iter()
                     .map(private_event)
                     .collect::<Vec<_>>()
                     .join("|")
             );
-            CommandResult::with_public(response, instrument_id, events)
+            CommandResult::with_public(response, result)
         }
         Err(_) => CommandResult::private("error unknown-instrument"),
     }
@@ -627,15 +565,18 @@ fn cancel(parts: &[&str], exchange: &Arc<ExchangeState>) -> CommandResult {
         return CommandResult::private("error invalid-order-id");
     };
 
-    match exchange
-        .venue
-        .lock()
-        .expect("venue mutex poisoned")
-        .cancel(instrument_id, order_id)
-    {
-        Ok(book_event) => {
-            let response = format!("ok events {}", private_event(&book_event));
-            CommandResult::with_public(response, instrument_id, vec![book_event])
+    match exchange.runtime.cancel(instrument_id, order_id) {
+        Ok(result) => {
+            let response = format!(
+                "ok events {}",
+                result
+                    .book_events
+                    .iter()
+                    .map(private_event)
+                    .collect::<Vec<_>>()
+                    .join("|")
+            );
+            CommandResult::with_public(response, result)
         }
         Err(_) => CommandResult::private("error unknown-instrument"),
     }
@@ -677,21 +618,20 @@ fn replace(parts: &[&str], exchange: &Arc<ExchangeState>, session: &OrderSession
     };
 
     match exchange
-        .venue
-        .lock()
-        .expect("venue mutex poisoned")
+        .runtime
         .replace_limit(instrument_id, old_order_id, order)
     {
-        Ok(events) => {
+        Ok(result) => {
             let response = format!(
                 "ok events {}",
-                events
+                result
+                    .book_events
                     .iter()
                     .map(private_event)
                     .collect::<Vec<_>>()
                     .join("|")
             );
-            CommandResult::with_public(response, instrument_id, events)
+            CommandResult::with_public(response, result)
         }
         Err(_) => CommandResult::private("error unknown-instrument"),
     }
@@ -705,13 +645,12 @@ fn account(parts: &[&str], exchange: &Arc<ExchangeState>, session: &OrderSession
         return "error usage account <asset>".to_string();
     }
     let asset = parts[1];
-    let venue = exchange.venue.lock().expect("venue mutex poisoned");
     format!(
         "ok account account={} asset={} available={} reserved={}",
         account_id,
         asset,
-        venue.balance(account_id, asset),
-        venue.reserved(account_id, asset)
+        exchange.runtime.balance(account_id, asset),
+        exchange.runtime.reserved(account_id, asset)
     )
 }
 
@@ -720,98 +659,13 @@ fn revenue(parts: &[&str], exchange: &Arc<ExchangeState>) -> String {
         return "error usage revenue <asset>".to_string();
     }
     let asset = parts[1];
-    let venue = exchange.venue.lock().expect("venue mutex poisoned");
-    format!("ok revenue asset={} amount={}", asset, venue.revenue(asset))
+    format!(
+        "ok revenue asset={} amount={}",
+        asset,
+        exchange.runtime.revenue(asset)
+    )
 }
 
 fn parse<T: std::str::FromStr>(value: &str) -> Option<T> {
     value.parse().ok()
-}
-
-fn levels(levels: &[Level]) -> String {
-    if levels.is_empty() {
-        return "-".to_string();
-    }
-
-    levels
-        .iter()
-        .map(|level| format!("{}@{}", level.quantity, level.price.0))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn is_public_event(event: &BookEvent) -> bool {
-    !matches!(
-        event,
-        BookEvent::Accepted { .. } | BookEvent::Rejected { .. }
-    )
-}
-
-fn event_seq(event: &BookEvent) -> u64 {
-    match event {
-        BookEvent::Accepted { seq, .. }
-        | BookEvent::Executed { seq, .. }
-        | BookEvent::Rested { seq, .. }
-        | BookEvent::Canceled { seq, .. }
-        | BookEvent::Rejected { seq, .. } => *seq,
-    }
-}
-
-fn private_event(event: &BookEvent) -> String {
-    match event {
-        BookEvent::Accepted { seq, order_id } => format!("accepted:{seq}:order={order_id}"),
-        BookEvent::Rejected {
-            seq,
-            order_id,
-            reason,
-        } => format!("rejected:{seq}:order={order_id}:reason={reason:?}"),
-        event => event_line(event),
-    }
-}
-
-fn event_line(event: &BookEvent) -> String {
-    match event {
-        BookEvent::Accepted { seq, order_id } => format!("accepted:{seq}:order={order_id}"),
-        BookEvent::Executed { seq, execution } => format!(
-            "executed:{seq}:resting={}:aggressing={}:qty={}:price={}",
-            execution.resting_order_id,
-            execution.aggressing_order_id,
-            execution.quantity,
-            execution.price.0
-        ),
-        BookEvent::Rested {
-            seq,
-            order_id,
-            side,
-            price,
-            quantity,
-        } => format!(
-            "rested:{seq}:order={order_id}:side={}:qty={quantity}:price={}",
-            side_name(*side),
-            price.0
-        ),
-        BookEvent::Canceled {
-            seq,
-            order_id,
-            side,
-            price,
-            quantity,
-        } => format!(
-            "canceled:{seq}:order={order_id}:side={}:qty={quantity}:price={}",
-            side_name(*side),
-            price.0
-        ),
-        BookEvent::Rejected {
-            seq,
-            order_id,
-            reason,
-        } => format!("rejected:{seq}:order={order_id}:reason={reason:?}"),
-    }
-}
-
-fn side_name(side: Side) -> &'static str {
-    match side {
-        Side::Buy => "buy",
-        Side::Sell => "sell",
-    }
 }

@@ -1,4 +1,5 @@
 use exchange_core::{BookEvent, NewOrder, Price, Side, Venue, VenueConfig};
+use exchange_runtime::{event_line, is_public_event};
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
 use std::fmt::Write as _;
@@ -1625,52 +1626,11 @@ fn synthetic_order(index: u64, traders: u64) -> NewOrder {
     }
 }
 
-fn is_public_event(event: &BookEvent) -> bool {
-    !matches!(
-        event,
-        BookEvent::Accepted { .. } | BookEvent::Rejected { .. }
-    )
-}
-
 fn format_public_event(event: &BookEvent) -> String {
-    match event {
-        BookEvent::Executed { seq, execution } => format!(
-            "executed:{seq}:resting={}:aggressing={}:qty={}:price={}",
-            execution.resting_order_id,
-            execution.aggressing_order_id,
-            execution.quantity,
-            execution.price.0
-        ),
-        BookEvent::Rested {
-            seq,
-            order_id,
-            side,
-            price,
-            quantity,
-        } => format!(
-            "rested:{seq}:order={order_id}:side={}:qty={quantity}:price={}",
-            side_name(*side),
-            price.0
-        ),
-        BookEvent::Canceled {
-            seq,
-            order_id,
-            side,
-            price,
-            quantity,
-        } => format!(
-            "canceled:{seq}:order={order_id}:side={}:qty={quantity}:price={}",
-            side_name(*side),
-            price.0
-        ),
-        BookEvent::Accepted { .. } | BookEvent::Rejected { .. } => String::new(),
-    }
-}
-
-fn side_name(side: Side) -> &'static str {
-    match side {
-        Side::Buy => "buy",
-        Side::Sell => "sell",
+    if is_public_event(event) {
+        event_line(event)
+    } else {
+        String::new()
     }
 }
 

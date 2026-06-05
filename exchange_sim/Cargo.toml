@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 exchange_core = { path = "../exchange_core" }
+exchange_runtime = { path = "../exchange_runtime" }
