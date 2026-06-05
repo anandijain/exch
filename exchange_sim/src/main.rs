@@ -1254,9 +1254,9 @@ fn live_demo_html() -> String {
     let mut html = String::new();
     let _ = writeln!(
         html,
-        "<!doctype html><meta charset=\"utf-8\"><title>exch live demo</title><style>body{{margin:0;font-family:system-ui,sans-serif;background:#07111f;color:#ecf3ff}}#app{{display:grid;grid-template-columns:330px 1fr 360px;min-height:100vh}}aside,.tape{{padding:18px;background:#101b2c;overflow:auto}}main{{padding:18px}}button{{font:inherit;border:1px solid #34445d;background:#17243a;color:#ecf3ff;border-radius:6px;padding:8px 10px;cursor:pointer}}button.active{{background:#2f80ed;border-color:#2f80ed}}.venue-grid,.edge-grid{{display:grid;gap:8px}}.venue-grid{{grid-template-columns:1fr 1fr}}.edge-grid{{grid-template-columns:repeat(3,1fr);margin:14px 0}}.panel{{background:#0d1828;border:1px solid #26374f;border-radius:8px;padding:14px;margin-bottom:14px}}.book{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}table{{width:100%;border-collapse:collapse}}td,th{{padding:5px 8px;border-bottom:1px solid #203047;text-align:right}}td:first-child,th:first-child{{text-align:left}}.asks td{{color:#ff7b91}}.bids td{{color:#64d17a}}.bar{{display:inline-block;height:10px;background:#2f80ed;border-radius:2px}}.muted{{color:#93a4bd}}pre{{white-space:pre-wrap;font:12px ui-monospace,monospace;line-height:1.45}}</style>"
+        "<!doctype html><meta charset=\"utf-8\"><title>exch live demo</title><style>body{{margin:0;font-family:system-ui,sans-serif;background:#07111f;color:#ecf3ff}}#app{{display:grid;grid-template-columns:330px 1fr 360px;min-height:100vh}}aside,.tape{{padding:18px;background:#101b2c;overflow:auto}}main{{padding:18px}}button{{font:inherit;border:1px solid #34445d;background:#17243a;color:#ecf3ff;border-radius:6px;padding:8px 10px;cursor:pointer}}button.active{{background:#2f80ed;border-color:#2f80ed}}.venue-grid,.edge-grid{{display:grid;gap:8px}}.venue-grid{{grid-template-columns:1fr 1fr}}.edge-grid{{grid-template-columns:repeat(3,1fr);margin:14px 0}}.panel{{background:#0d1828;border:1px solid #26374f;border-radius:8px;padding:14px;margin-bottom:14px}}.asset-graph{{width:100%;height:330px;background:#091525;border:1px solid #203047;border-radius:8px;margin:12px 0}}.graph-edge{{stroke:#405a7c;stroke-width:7;stroke-linecap:round;cursor:pointer;opacity:.72}}.graph-edge.active,.graph-edge:hover{{stroke:#2f80ed;opacity:1}}.graph-node{{fill:#17243a;stroke:#77a7ff;stroke-width:2}}.graph-center{{fill:#2f80ed;stroke:#b7d1ff}}.graph-label{{fill:#ecf3ff;font-size:14px;text-anchor:middle;dominant-baseline:middle;pointer-events:none}}.book{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}table{{width:100%;border-collapse:collapse}}td,th{{padding:5px 8px;border-bottom:1px solid #203047;text-align:right}}td:first-child,th:first-child{{text-align:left}}.asks td{{color:#ff7b91}}.bids td{{color:#64d17a}}.bar{{display:inline-block;height:10px;background:#2f80ed;border-radius:2px}}.muted{{color:#93a4bd}}pre{{white-space:pre-wrap;font:12px ui-monospace,monospace;line-height:1.45}}</style>"
     );
-    let _ = writeln!(html, "<div id=\"app\"><aside><h1>exch live</h1><p class=\"muted\">Four live venues, 24 books, synthetic high-activity order flow. Click a venue and edge.</p><div id=\"venues\" class=\"venue-grid\"></div><div class=\"panel\"><div id=\"stats\"></div></div></aside><main><section class=\"panel\"><h2 id=\"venue-title\">venue</h2><div id=\"edges\" class=\"edge-grid\"></div></section><section class=\"panel\"><h2 id=\"edge-title\">book</h2><div class=\"book\"><div><h3>Asks</h3><table class=\"asks\"><tbody id=\"asks\"></tbody></table></div><div><h3>Bids</h3><table class=\"bids\"><tbody id=\"bids\"></tbody></table></div></div></section></main><section class=\"tape\"><h2>Event Tape</h2><pre id=\"tape\"></pre></section></div>");
+    let _ = writeln!(html, "<div id=\"app\"><aside><h1>exch live</h1><p class=\"muted\">Four live venues, 24 books, synthetic high-activity order flow. Click a venue; hover a graph edge to inspect that book.</p><div id=\"venues\" class=\"venue-grid\"></div><div class=\"panel\"><div id=\"stats\"></div></div></aside><main><section class=\"panel\"><h2 id=\"venue-title\">venue</h2><svg id=\"asset-graph\" class=\"asset-graph\" viewBox=\"0 0 720 330\" role=\"img\" aria-label=\"venue asset graph\"></svg><div id=\"edges\" class=\"edge-grid\"></div></section><section class=\"panel\"><h2 id=\"edge-title\">book</h2><div class=\"book\"><div><h3>Asks</h3><table class=\"asks\"><tbody id=\"asks\"></tbody></table></div><div><h3>Bids</h3><table class=\"bids\"><tbody id=\"bids\"></tbody></table></div></div></section></main><section class=\"tape\"><h2>Event Tape</h2><pre id=\"tape\"></pre></section></div>");
     let _ = writeln!(html, "<script>{}</script>", live_demo_js());
     html
 }
@@ -1277,6 +1277,7 @@ function render() {
   if (!state) return;
   renderVenues();
   renderEdges();
+  renderGraph();
   renderBook();
   document.getElementById('stats').innerHTML = `<b>step</b> ${state.step}<br><b>venues</b> ${state.venues.length}<br><b>books</b> ${state.venues.reduce((n,v)=>n+v.books.length,0)}`;
   document.getElementById('tape').textContent = state.tape.join('\n');
@@ -1303,9 +1304,68 @@ function renderEdges() {
     const b = document.createElement('button');
     b.className = index === edgeIndex ? 'active' : '';
     b.textContent = `${symbol}/USD`;
-    b.onclick = () => { edgeIndex = index; renderBook(); renderEdges(); };
+    b.onmouseenter = () => selectEdge(index);
+    b.onclick = () => selectEdge(index);
     el.appendChild(b);
   });
+}
+
+function renderGraph() {
+  const venue = state.venues[venueIndex];
+  const svg = document.getElementById('asset-graph');
+  const cx = 360;
+  const cy = 165;
+  const r = 112;
+  const points = venue.symbols.map((symbol, index) => {
+    const angle = -Math.PI / 2 + index * Math.PI * 2 / venue.symbols.length;
+    return {symbol, index, x: cx + Math.cos(angle) * r, y: cy + Math.sin(angle) * r};
+  });
+
+  svg.innerHTML = '';
+  points.forEach(point => {
+    const edge = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    edge.setAttribute('x1', cx);
+    edge.setAttribute('y1', cy);
+    edge.setAttribute('x2', point.x);
+    edge.setAttribute('y2', point.y);
+    edge.setAttribute('class', 'graph-edge' + (point.index === edgeIndex ? ' active' : ''));
+    edge.onmouseenter = () => selectEdge(point.index);
+    edge.onclick = () => selectEdge(point.index);
+    svg.appendChild(edge);
+  });
+
+  points.forEach(point => {
+    node(svg, point.x, point.y, point.symbol, 'graph-node');
+    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    label.setAttribute('x', point.x);
+    label.setAttribute('y', point.y);
+    label.setAttribute('class', 'graph-label');
+    label.textContent = point.symbol;
+    svg.appendChild(label);
+  });
+  node(svg, cx, cy, 'USD', 'graph-node graph-center');
+  const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+  label.setAttribute('x', cx);
+  label.setAttribute('y', cy);
+  label.setAttribute('class', 'graph-label');
+  label.textContent = 'USD';
+  svg.appendChild(label);
+}
+
+function node(svg, x, y, label, className) {
+  const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  circle.setAttribute('cx', x);
+  circle.setAttribute('cy', y);
+  circle.setAttribute('r', label === 'USD' ? 28 : 24);
+  circle.setAttribute('class', className);
+  svg.appendChild(circle);
+}
+
+function selectEdge(index) {
+  edgeIndex = index;
+  renderEdges();
+  renderGraph();
+  renderBook();
 }
 
 function renderBook() {
@@ -1789,6 +1849,10 @@ mod tests {
         assert!(json.contains("\"step\":42"));
         assert!(json.contains("ny-core"));
         assert!(json.contains("\"bids\""));
-        assert!(live_demo_html().contains("exch live"));
+        let html = live_demo_html();
+        assert!(html.contains("exch live"));
+        assert!(html.contains("asset-graph"));
+        assert!(html.contains("graph-edge"));
+        assert!(html.contains("function renderGraph"));
     }
 }
